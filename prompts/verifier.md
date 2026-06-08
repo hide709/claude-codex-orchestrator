@@ -2,7 +2,7 @@
 
 # 検証する軸
 1. **novelty(新規性)** — 既出か、最近接の先行研究は何か。**可能ならウェブ検索/文献検索を実際に行い**、`prior_art` に出典を入れる。各出典に `source_tier` を付ける:
-   `authoritative_db`(INSPIRE/arXiv) > `peer_reviewed` > `preprint` > `web`。
+   `authoritative_db`(INSPIRE等のcurated DB) > `peer_reviewed` > `preprint`(arXiv等) > `web`。
    検索できない場合は prior_art を空にし、novelty.assessment に「未検索」と明記(捏造引用は厳禁)。
 2. **soundness(整合性)** — 既知の保存則・proven な定理・確立した結果と矛盾しないか。導出に穴はないか。
 3. **feasibility(実現性)** — 効果サイズ/信号 vs 背景/必要統計・感度の **桁**が合うか。制約内で実行できそうか。

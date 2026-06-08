@@ -136,8 +136,8 @@
   - **候補同士を比較しない**(横断は ARBITER の仕事)。
   - **「良し悪し」を主観判定しない。** 測れる事実だけを出す。
   - **生成者と同一であってはならない**(Codex worker が自分用の Verifier/gate を設計するのは利益相反。gate は PLANNER/人間が事前固定)。
-- **重要(研究の新規性):** 文献チェックは AI の記憶でやらない。**実DB(INSPIRE-HEP / arXiv / Semantic Scholar / ADS) + 一般ウェブ検索** で検索する(幻覚引用・recall漏れを防ぐ)。一般ウェブは breadth/recall 用。**出典を tier 付けして evidence に記録**する:
-    - 権威DB(INSPIRE/arXiv) > 査読論文 > preprint > web/blog
+- **重要(研究の新規性):** 文献チェックは AI の記憶でやらない。**実DB(INSPIRE-HEP / Semantic Scholar / ADS) + arXiv + 一般ウェブ検索** で検索する(幻覚引用・recall漏れを防ぐ)。一般ウェブは breadth/recall 用。**出典を tier 付けして evidence に記録**する:
+    - 権威DB(INSPIRE等のcurated DB) > 査読論文 > preprint(arXiv等) > web/blog
     - 低 tier(blog 等)を単独で「先行研究が否定」などの反証扱いにしない。
 
 ### 3.6 HARD GATE

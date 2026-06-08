@@ -456,7 +456,9 @@ def _search_terms(text, max_terms):
 def collect_prior_art(c, cfg, run):
     """Tier0 novelty の補助: arXiv API から候補文献を取り、artifact として残す。"""
     if not cfg.get("lit_search_enabled", True):
-        return {"enabled": False, "query": "", "results": [], "error": ""}
+        data = {"enabled": False, "query": "", "results": [], "error": ""}
+        write_json(run, f"evidence/{c['id']}.arxiv.json", data)
+        return data
 
     text = " ".join(str(c.get(k, "")) for k in
                     ("question", "hypothesis", "novelty_claim", "test_method"))
@@ -507,7 +509,9 @@ def collect_prior_art(c, cfg, run):
 def collect_inspire(c, cfg, run):
     """Tier0 novelty 補助: INSPIRE-HEP(HEP の権威DB)から候補文献を取り artifact 化。"""
     if not cfg.get("inspire_enabled", True):
-        return {"enabled": False, "query": "", "results": [], "error": ""}
+        data = {"enabled": False, "query": "", "results": [], "error": ""}
+        write_json(run, f"evidence/{c['id']}.inspire.json", data)
+        return data
     text = " ".join(str(c.get(k, "")) for k in
                     ("question", "hypothesis", "novelty_claim", "test_method"))
     terms = _search_terms(text, int(cfg.get("lit_search_max_terms", 6)))
@@ -553,9 +557,15 @@ def collect_evidence(c, cfg, run):
     §8 Read プレーン: 許可した read-only API のみ叩き、結果はスナップショット保存。"""
     if not cfg.get("lit_search_enabled", True):
         empty = {"enabled": False, "query": "", "results": [], "error": ""}
+        write_json(run, f"evidence/{c['id']}.arxiv.json", empty)
+        write_json(run, f"evidence/{c['id']}.inspire.json", empty)
         return {"arxiv": empty, "inspire": empty}
     return {"arxiv": collect_prior_art(c, cfg, run),
             "inspire": collect_inspire(c, cfg, run)}
+
+
+def evidence_refs(c):
+    return [f"evidence/{c['id']}.arxiv.json", f"evidence/{c['id']}.inspire.json"]
 
 
 def verify(runner, cands, cfg, run):
@@ -588,18 +598,19 @@ def verify(runner, cands, cfg, run):
         try:
             verdict = runner.run(prompt, VERDICT_SCHEMA, "verdict", label, run["log"])
             verdict["provenance"] = provenance(run, cfg, "verify", label, target=c["id"])
-            verdict["evidence_refs"] = [f"evidence/{c['id']}.arxiv.json",
-                                        f"evidence/{c['id']}.inspire.json"]
+            verdict["evidence_refs"] = evidence_refs(c)
             return c["id"], verdict
         except Exception as e:
             log(run, f"  [verify {c['id']}] FAILED: {e}")
             return c["id"], {"verdict": "flag", "kill_reason": "",
-                             "notes": f"検証エラー(要再実行): {e}",
-                             "novelty": {"assessment": "未検証", "confidence": "low"},
-                             "soundness": {"assessment": "未検証", "confidence": "low"},
-                             "feasibility": {"assessment": "未検証", "confidence": "low"},
-                             "significance": {"assessment": "未検証", "confidence": "low"},
-                             "prior_art": []}
+                              "notes": f"検証エラー(要再実行): {e}",
+                              "novelty": {"assessment": "未検証", "confidence": "low"},
+                              "soundness": {"assessment": "未検証", "confidence": "low"},
+                              "feasibility": {"assessment": "未検証", "confidence": "low"},
+                              "significance": {"assessment": "未検証", "confidence": "low"},
+                              "prior_art": [],
+                              "provenance": provenance(run, cfg, "verify", label, target=c["id"]),
+                              "evidence_refs": evidence_refs(c)}
 
     verdicts = dict(_parallel(cfg, [(one, (c,)) for c in cands]))
     for c in cands:
