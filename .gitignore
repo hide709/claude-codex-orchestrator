@@ -1,6 +1,9 @@
 # 実行ごとの生成物(成果物・ログ。再現可能なので追跡しない)
 runs/
 
+# 自動メモリ(重複検知用の使い捨てキャッシュ。decisions.jsonl/preferences.md は追跡する)
+memory/seen.jsonl
+
 # Python
 __pycache__/
 *.pyc

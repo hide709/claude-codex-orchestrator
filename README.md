@@ -59,6 +59,21 @@ runs/<id>/
 - **検証ゲートの方針**: 自動 reject は**客観基準(形不備など)のみ**。LLM の `kill` は推奨扱いで落とさず、
   `decision_matrix` に `kill?(LLM/要確認)` として残す(誤kill救済 / ARCHITECTURE §3.6)。
 
+## メモリ(cross-run / Issue #23)
+run をまたいで「却下した線・採用した方向・好み」を覚え、**次回の生成と検証に反映**する。
+永続するのは **人間が記録した知識だけ**(`memory/`)。`runs/` は使い捨てのまま。
+
+```bash
+python orchestrate.py promote <run_id> <cand_id> --note "追求する理由"
+python orchestrate.py reject  <run_id> <cand_id> --note "死んだ線の理由"
+python orchestrate.py prefer  "高novelty優先 / ビームダイナミクス系統に注力"
+```
+
+- `memory/decisions.jsonl`(commit)= 採用/却下、`memory/preferences.md`(commit)= 好み、
+  `memory/seen.jsonl`(gitignore)= 重複検知用の自動キャッシュ。
+- 効き方: 却下済みは**再提案しない** / 好みに寄せる / 既出と重複する候補は `REPORT.md` で印(**検知のみ・棄却しない**)。
+- 原則は ARCHITECTURE §0(AI判断で自動棄却しない)。詳細は `memory/README.md`。
+
 ## このMVPでまだやっていないこと(ARCHITECTURE §12)
 - **Spec / Patch ステージ**(重心は IDEA なので未実装)。
 - claude worker(CLI 未導入)。今は codex を複数レンズで回す=**戦略多様性**で代替。

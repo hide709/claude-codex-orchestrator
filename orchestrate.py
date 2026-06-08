@@ -31,6 +31,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 PROMPTS_DIR = ROOT / "prompts"
+MEMORY_DIR = ROOT / "memory"
 
 # ----------------------------------------------------------------------------
 # 発散レンズ (ARCHITECTURE §3.3 / 研究向け)
@@ -296,6 +297,160 @@ def load_prompt(name):
 
 
 # ----------------------------------------------------------------------------
+# Cross-run memory  (program_creater の memory/ に対応 / Issue #23)
+#   seen.jsonl       : 自動。重複『検知』のみ(kill しない)。gitignore。
+#   decisions.jsonl  : 人間が promote/reject で記録(正本)。commit。
+#   preferences.md   : 人間が prefer で記録。commit。
+#   原則: 永続するのは人間が採用/却下した知識だけ。AI 判断で自動棄却はしない。
+# ----------------------------------------------------------------------------
+def _read_jsonl(path):
+    out = []
+    if path.exists():
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            line = line.strip()
+            if line:
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    print(f"[memory] skip malformed JSONL: {path}:{lineno}: {e}", file=sys.stderr)
+    return out
+
+
+def load_memory():
+    MEMORY_DIR.mkdir(exist_ok=True)
+    prefs = ""
+    pfile = MEMORY_DIR / "preferences.md"
+    if pfile.exists():
+        prefs = "\n".join(l for l in pfile.read_text(encoding="utf-8").splitlines()
+                          if l.strip().startswith("- ") and l.strip() != "- なし")
+    return {"decisions": _read_jsonl(MEMORY_DIR / "decisions.jsonl"),
+            "seen": _read_jsonl(MEMORY_DIR / "seen.jsonl"),
+            "preferences": prefs.strip()}
+
+
+def memory_digest(mem, max_each=8):
+    """生成プロンプトに差し込む memory 要約。"""
+    out = []
+    if mem["preferences"]:
+        out.append("## 研究者の好み(尊重する)\n" + mem["preferences"][:800])
+    rej = [d for d in mem["decisions"] if d.get("kind") == "reject"][-max_each:]
+    if rej:
+        out.append("## 却下済みの線(再提案しない)\n" + "\n".join(
+            f"- {d.get('hypothesis','')[:120]}" + (f"  (理由: {d['note']})" if d.get("note") else "")
+            for d in rej))
+    prom = [d for d in mem["decisions"] if d.get("kind") == "promote"][-max_each:]
+    if prom:
+        out.append("## 過去に採用した方向(重複は避け、隣接の新規性を狙う)\n" + "\n".join(
+            f"- {d.get('hypothesis','')[:120]}" for d in prom))
+    seen = mem["seen"][-max_each * 2:]
+    if seen:
+        out.append("## 既出の候補(重複を避ける)\n" + "\n".join(
+            f"- {s.get('hypothesis','')[:100]}" for s in seen))
+    return "\n\n".join(out) if out else "(まだ記憶なし)"
+
+
+def memory_reject_hint(mem, max_items=6):
+    """検証プロンプトに渡す『人間が却下済みの線』ヒント(再tread検出用。kill はしない)。"""
+    rej = [d for d in mem["decisions"] if d.get("kind") == "reject"][-max_items:]
+    if not rej:
+        return ""
+    return "[memory] 人間が過去に却下した線(再treadなら novelty を低めに・relation で明示):\n" + "\n".join(
+        f"- {d.get('hypothesis','')[:120]}" + (f" (理由: {d['note']})" if d.get("note") else "") for d in rej)
+
+
+def _bigrams(text):
+    t = re.sub(r"\s+", "", str(text)).lower()
+    return {t[i:i + 2] for i in range(len(t) - 1)} if len(t) >= 2 else ({t} if t else set())
+
+
+def _similarity(a, b):
+    A, B = _bigrams(a), _bigrams(b)
+    if not A or not B:
+        return 0.0
+    return len(A & B) / len(A | B)
+
+
+def mark_near_duplicates(cands, mem, threshold=0.5, max_seen=500):
+    """過去 run の候補と似ていれば印を付ける(重複『検知』のみ。落とさない)。"""
+    seen = mem["seen"][-max_seen:]
+    for c in cands:
+        text = c.get("question", "") + c.get("hypothesis", "")
+        best_s, best = 0.0, None
+        for s in seen:
+            sim = _similarity(text, s.get("question", "") + s.get("hypothesis", ""))
+            if sim > best_s:
+                best_s, best = sim, s
+        if best and best_s >= threshold:
+            c["_near_dup"] = {"run": best.get("run"), "id": best.get("id"), "score": round(best_s, 2)}
+
+
+def append_seen(run, cands):
+    """この run の候補を seen.jsonl に追記(重複検知用の自動メモリ)。"""
+    MEMORY_DIR.mkdir(exist_ok=True)
+    with (MEMORY_DIR / "seen.jsonl").open("a", encoding="utf-8") as f:
+        for c in cands:
+            f.write(json.dumps({
+                "run": run["id"], "id": c["id"], "lens": c.get("_lens", ""),
+                "question": c.get("question", ""), "hypothesis": c.get("hypothesis", ""),
+                "verdict": (c.get("_verdict") or {}).get("verdict", ""),
+                "llm_kill": bool(c.get("_llm_kill")), "created": run["created"],
+            }, ensure_ascii=False) + "\n")
+
+
+def _safe_component(value, label):
+    text = str(value)
+    if not text or text in (".", "..") or any(sep in text for sep in ("/", "\\")):
+        raise ValueError(f"{label} にパス区切りや不正値は使えません: {value!r}")
+    return text
+
+
+def _load_candidate(run_id, cand_id):
+    run_id = _safe_component(run_id, "run_id")
+    cand_id = _safe_component(cand_id, "cand_id")
+    base = ROOT / "runs" / run_id
+    for sub in ("revised", "candidates"):
+        p = base / sub / f"{cand_id}.json"
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+    return None
+
+
+def cmd_memory(kind, argv):
+    """人間がメモリを書く CLI: promote/reject <run> <id> [--note] / prefer "text"。"""
+    MEMORY_DIR.mkdir(exist_ok=True)
+    if kind == "prefer":
+        text = " ".join(argv).strip()
+        if not text:
+            print('使い方: python orchestrate.py prefer "好み・方針のテキスト"')
+            sys.exit(1)
+        pfile = MEMORY_DIR / "preferences.md"
+        if not pfile.exists():
+            pfile.write_text("# Preferences\n\n研究者の好み・方針(生成時に尊重)。\n\n", encoding="utf-8")
+        with pfile.open("a", encoding="utf-8") as f:
+            f.write(f"- ({_now()[:10]}) {text}\n")
+        print("好みを記録 → memory/preferences.md")
+        return
+    ap = argparse.ArgumentParser(prog=f"orchestrate.py {kind}")
+    ap.add_argument("run_id")
+    ap.add_argument("cand_id")
+    ap.add_argument("--note", default="")
+    a = ap.parse_args(argv)
+    try:
+        c = _load_candidate(a.run_id, a.cand_id)
+    except ValueError as e:
+        print(e)
+        sys.exit(1)
+    if not c:
+        print(f"候補が見つからない: runs/{a.run_id}/(revised|candidates)/{a.cand_id}.json")
+        sys.exit(1)
+    rec = {"date": _now()[:10], "kind": kind, "run": a.run_id, "id": a.cand_id,
+           "hypothesis": c.get("hypothesis", ""), "note": a.note}
+    with (MEMORY_DIR / "decisions.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    print(f"記録: {kind} {a.run_id}/{a.cand_id} → memory/decisions.jsonl")
+
+
+# ----------------------------------------------------------------------------
 # 段階 (stages)
 # ----------------------------------------------------------------------------
 def planner(seed, constraints, cfg, run):
@@ -336,15 +491,16 @@ def provenance(run, cfg, stage, label, **extra):
     return data
 
 
-def generate(runner, charter, cfg, run):
-    """発散: レンズごとに独立生成(互いを見ない)。並列。"""
+def generate(runner, charter, cfg, run, mem):
+    """発散: レンズごとに独立生成(互いを見ない)。並列。memory で重複回避・好み反映。"""
     tmpl = load_prompt("ideator")
     lenses = charter["lenses"]
+    digest = memory_digest(mem)
 
     def one(i, lens):
         label = f"gen_{i:02d}__{lens}"
         prompt = render(tmpl, seed=charter["seed"], constraints=charter["constraints"],
-                        lens=lens, lens_desc=LENS_DESC.get(lens, lens),
+                        lens=lens, lens_desc=LENS_DESC.get(lens, lens), memory=digest,
                         schema=json.dumps(HYPOTHESIS_SCHEMA, ensure_ascii=False))
         try:
             data = runner.run(prompt, HYPOTHESIS_SCHEMA, "hypothesis", label, run["log"])
@@ -358,9 +514,12 @@ def generate(runner, charter, cfg, run):
 
     cands = _parallel(cfg, [(one, (i, lens)) for i, lens in enumerate(lenses)])
     cands = [c for c in cands if c]
+    mark_near_duplicates(cands, mem)            # 過去 run との重複を『検知』(落とさない)
     for c in cands:
         write_json(run, f"candidates/{c['id']}.json", c)
-    log(run, f"  生成: {len(cands)}/{len(lenses)} 候補")
+    ndup = sum(1 for c in cands if c.get("_near_dup"))
+    log(run, f"  生成: {len(cands)}/{len(lenses)} 候補" +
+        (f" / 過去と類似 {ndup}件(重複注意)" if ndup else ""))
     return cands
 
 
@@ -421,6 +580,8 @@ def revise(runner, cands, cfg, run):
             data["_lens"] = c.get("_lens", "?")
             data["_review"] = c.get("_review", {"attacks": []})
             data["_verify_todo"] = c.get("_verify_todo", [])
+            if c.get("_near_dup"):
+                data["_near_dup"] = c["_near_dup"]   # 重複検知の印を改訂後にも引き継ぐ
             data["provenance"] = provenance(run, cfg, "revise", label,
                                             lens=c.get("_lens", "?"), revised_from=c["id"])
             return data
@@ -568,7 +729,7 @@ def evidence_refs(c):
     return [f"evidence/{c['id']}.arxiv.json", f"evidence/{c['id']}.inspire.json"]
 
 
-def verify(runner, cands, cfg, run):
+def verify(runner, cands, cfg, run, mem):
     """Tier0 検証: 形(決定的) + 文献/soundness/feasibility(独立な検証呼び出し)。"""
     tmpl = load_prompt("verifier")
     required = HYPOTHESIS_SCHEMA["required"]
@@ -589,10 +750,14 @@ def verify(runner, cands, cfg, run):
             return c["id"], {"_form_fail": miss, "verdict": "kill",
                              "kill_reason": f"形不備(必須欠落): {', '.join(miss)}"}
         prior_art_hint = collect_evidence(c, cfg, run)
+        todo_items = list(c.get("_verify_todo", []))
+        _rej = memory_reject_hint(mem)
+        if _rej:
+            todo_items.append(_rej)
         prompt = render(tmpl,
                         candidate=json.dumps({k: v for k, v in c.items() if not k.startswith("_")},
                                              ensure_ascii=False, indent=2),
-                        todo="\n".join(c.get("_verify_todo", [])) or "(なし)",
+                        todo="\n".join(todo_items) or "(なし)",
                         prior_art_hint=json.dumps(prior_art_hint, ensure_ascii=False, indent=2),
                         schema=json.dumps(VERDICT_SCHEMA, ensure_ascii=False))
         try:
@@ -719,6 +884,10 @@ def report(charter, survivors, all_cands, run):
           + (f" / 内 LLM-kill推奨 {sum(1 for c in survivors if c.get('_llm_kill'))}(要人間確認)"
              if any(c.get('_llm_kill') for c in survivors) else ""),
           f"- created: {run['created']}\n",
+          *(["## ⚠ 過去 run との重複注意(検知のみ・棄却ではない)",
+             *[f"- {c['id']}: 過去 {c['_near_dup']['run']}/{c['_near_dup']['id']} と類似 "
+               f"(bigram {c['_near_dup']['score']})" for c in all_cands if c.get('_near_dup')], ""]
+            if any(c.get('_near_dup') for c in all_cands) else []),
           "## 読み方",
           "1. `decision_matrix.md` … 生存候補を評価軸ごとに(単一スコアに潰さず)一覧。",
           "2. `candidates/*.json` … 各 Research Hypothesis Contract。",
@@ -733,6 +902,8 @@ def report(charter, survivors, all_cands, run):
           "- prior_art の source_tier が低い novelty 判定は、権威DB(INSPIRE等)で裏取りする。",
           "- flag(通説違反など)は消さず、面白い線として別途検討。",
           "- `kill?(LLM/要確認)` は LLM の棄却理由が客観的に正しいか人間が確認(誤kill救済)。",
+          "- 採用/却下を memory に記録 → 次回生成へ反映: "
+          "`python orchestrate.py promote <run> <id>` / `reject <run> <id> --note \"理由\"` / `prefer \"好み\"`",
           ""]
     write_text(run, "REPORT.md", "\n".join(md))
 
@@ -809,6 +980,10 @@ def main():
         except Exception:
             pass
 
+    # memory 書き込み用サブコマンド(人間が採用/却下/好みを記録)
+    if len(sys.argv) > 1 and sys.argv[1] in ("promote", "reject", "prefer"):
+        return cmd_memory(sys.argv[1], sys.argv[2:])
+
     ap = argparse.ArgumentParser(description="IDEA-stage funnel MVP (ARCHITECTURE §11)")
     ap.add_argument("--seed", help="研究の種(問い or hunch)")
     ap.add_argument("--seed-file", help="種をファイルから読む")
@@ -835,13 +1010,16 @@ def main():
 
     run = new_run(seed, cfg)
     runner = make_runner(cfg)
+    mem = load_memory()
     print(f"\n=== RUN {run['id']}  (engine={cfg['engine']}, model={cfg['model']}) ===")
-    print(f"seed: {seed}\n")
+    print(f"seed: {seed}")
+    print(f"memory: 既出候補 {len(mem['seen'])} / 決定 {len(mem['decisions'])} / "
+          f"好み {'有' if mem['preferences'] else '無'}\n")
 
     log(run, "[1/7] PLANNER  — charter 固定")
     charter = planner(seed, args.constraints, cfg, run)
-    log(run, "[2/7] GENERATE — 発散(独立・並列)")
-    cands = generate(runner, charter, cfg, run)
+    log(run, "[2/7] GENERATE — 発散(独立・並列・memory反映)")
+    cands = generate(runner, charter, cfg, run, mem)
     if not cands:
         print("候補が0件。engine/認証/timeout を確認(--engine mock で配管だけ検証可)。")
         sys.exit(1)
@@ -850,13 +1028,14 @@ def main():
     log(run, "[4/7] REVISE   — 攻撃を受けて仮説を1回だけ改訂")
     cands = revise(runner, cands, cfg, run)
     log(run, "[5/7] VERIFY   — Tier0(形/文献/soundness/feasibility)")
-    cands = verify(runner, cands, cfg, run)
+    cands = verify(runner, cands, cfg, run, mem)
     log(run, "[6/7] HARD GATE— kill を捨て案台帳へ")
     survivors = hard_gate(cands, run)
     log(run, "[7/7] ARBITER  — 整理(勝者は選ばない)")
     arbiter(survivors, run)
     write_unresolved(cands, run)
     report(charter, survivors, cands, run)
+    append_seen(run, cands)                     # 自動メモリ(重複検知用)に追記
 
     write_text(run, "run.log", "\n".join(run["_logbuf"]))
     print(f"\n✅ 完了 → {run['dir']}")
