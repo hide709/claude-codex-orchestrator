@@ -12,7 +12,7 @@ engine ごとに独立した queue を持つ:
 
 **Windows(PowerShell)** — 新しいウィンドウ/タブで:
 ```powershell
-cd C:\Users\hide\Documents\work\orchestration
+cd C:\path\to\claude-codex-orchestrator
 .\tools\start-worker.ps1 codex      # codex worker
 # 別ウィンドウで
 .\tools\start-worker.ps1 claude     # claude worker
@@ -30,7 +30,8 @@ cd C:\Users\hide\Documents\work\orchestration
 2. **inbox を監視**: `queue/<engine>/inbox/*.json` のうち、対応する `queue/<engine>/reports/<同名>.json` が無いものを探す。
 3. 各タスク `{label, kind, schema, prompt}` について:
    - `prompt` に従い、**`schema` に厳密準拠した JSON だけ**を生成(説明文・コードフェンス禁止)。
-   - 結果を `queue/<engine>/reports/<同名>.json` に JSON のみで書く。
+   - 結果はまず `queue/<engine>/reports/<同名>.json.tmp` に JSON のみで書き、完成後に
+     `queue/<engine>/reports/<同名>.json` へ rename / move する(途中読みを避ける)。
 4. 1〜3 を繰り返す(新規が来るまで待機)。
 
 ## ルール

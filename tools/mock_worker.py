@@ -61,8 +61,10 @@ def main():
                 task = json.loads(f.read_text(encoding="utf-8"))
             except Exception:
                 continue
-            rep.write_text(json.dumps(mock(engine, task.get("kind"), task.get("label", "")),
+            tmp = rep.with_suffix(rep.suffix + ".tmp")
+            tmp.write_text(json.dumps(mock(engine, task.get("kind"), task.get("label", "")),
                                       ensure_ascii=False), encoding="utf-8")
+            tmp.replace(rep)
             n += 1
             print(f"  serviced {f.name} (kind={task.get('kind')})", flush=True)
         time.sleep(1)

@@ -12,7 +12,7 @@ orchestrate.py — IDEA-stage funnel MVP   (see ARCHITECTURE.md §11)
   - VERIFIER は生成者と別呼び出し(独立)。red-team は judge しない(attack -> convert)。
   - soft score を単一値に潰さない。落選は捨て案台帳へ(消さない)。
 
-依存: Python 標準ライブラリのみ。engine は codex CLI(claude は CLI があれば差し替え可)。
+依存: Python 標準ライブラリのみ。engine は常駐 worker + queue 経由で呼ぶ。
 """
 
 import argparse
@@ -175,22 +175,39 @@ class QueueRunner:
         self.timeout = cfg.get("queue_timeout_sec", cfg.get("timeout_sec", 600))
 
     def run(self, prompt, schema, kind, label, logdir):
+        if not worker_alive(self.engine, self.cfg):
+            raise RunnerError(f"{self.engine} worker heartbeat が無い/古い: "
+                              f"tools/start-worker.ps1 {self.engine} で常駐 worker を起動してください")
         inbox_f = self.qin / f"{label}.json"
         report_f = self.qout / f"{label}.json"
+        tmp_f = self.qin / f".{label}.{os.getpid()}.tmp"
         if report_f.exists():
             report_f.unlink()
-        inbox_f.write_text(json.dumps(
+        payload = json.dumps(
             {"label": label, "kind": kind, "schema": schema, "prompt": prompt, "created": _now()},
-            ensure_ascii=False, indent=2), encoding="utf-8")
+            ensure_ascii=False, indent=2)
+        tmp_f.write_text(payload, encoding="utf-8")
+        tmp_f.replace(inbox_f)
         waited = 0
         while waited < self.timeout:
             if report_f.exists():
                 raw = report_f.read_text(encoding="utf-8", errors="replace")
                 (logdir / f"{label}.log.txt").write_text(
                     f"[{self.engine}-queue] {label}\n--- report ---\n{raw}", encoding="utf-8")
-                return _extract_json(raw)
+                try:
+                    return _extract_json(raw)
+                finally:
+                    for p in (inbox_f, report_f):
+                        try:
+                            p.unlink()
+                        except FileNotFoundError:
+                            pass
             time.sleep(self.poll)
             waited += self.poll
+        try:
+            inbox_f.unlink()
+        except FileNotFoundError:
+            pass
         raise RunnerError(f"{self.engine} queue timeout ({self.timeout}s): "
                           f"常駐 {self.engine} worker が稼働しているか確認(tools/start-worker.ps1 {self.engine})")
 
@@ -482,19 +499,21 @@ def generate(runner, charter, cfg, run, mem):
         return runner_cache[eng]
 
     def one(i, lens):
-        label = f"gen_{i:02d}__{lens}"
+        label = f"{run['id']}__gen_{i:02d}__{lens}"
         eng = assign[i]
         prompt = render(tmpl, seed=charter["seed"], constraints=charter["constraints"],
                         lens=lens, lens_desc=LENS_DESC.get(lens, lens), memory=digest,
                         schema=json.dumps(HYPOTHESIS_SCHEMA, ensure_ascii=False))
         used = eng
+        used_label = label
         try:
             data = get_runner(eng).run(prompt, HYPOTHESIS_SCHEMA, "hypothesis", label, run["log"])
         except Exception as e:
             if eng != fallback:   # 失敗したら別の live engine にフォールバック
                 log(run, f"  [gen {lens}] {eng} 失敗({e}) → {fallback} で再試行")
                 try:
-                    data = get_runner(fallback).run(prompt, HYPOTHESIS_SCHEMA, "hypothesis", label, run["log"])
+                    used_label = f"{label}__fallback_{fallback}"
+                    data = get_runner(fallback).run(prompt, HYPOTHESIS_SCHEMA, "hypothesis", used_label, run["log"])
                     used = f"{fallback}(fallback<{eng})"
                 except Exception as e2:
                     log(run, f"  [gen {lens}] {fallback} も失敗: {e2}")
@@ -505,7 +524,7 @@ def generate(runner, charter, cfg, run, mem):
         data["id"] = f"rq-{i:02d}"
         data["_lens"] = lens
         data["_engine"] = used
-        data["provenance"] = provenance(run, cfg, "generate", label, lens=lens, engine=used)
+        data["provenance"] = provenance(run, cfg, "generate", used_label, lens=lens, engine=used)
         return data
 
     cands = _parallel(cfg, [(one, (i, lens)) for i, lens in enumerate(lenses)])
@@ -528,7 +547,7 @@ def redteam(runner, cands, cfg, run):
     tmpl = load_prompt("redteam")
 
     def one(c):
-        label = f"review_{c['id']}"
+        label = f"{run['id']}__review_{c['id']}"
         # blind: 著者(レンズ)情報は渡さない
         shown = {k: v for k, v in c.items()
                  if not k.startswith("_") and k not in ("id", "provenance")}
@@ -544,7 +563,7 @@ def redteam(runner, cands, cfg, run):
     variants = []        # stronger_variant: 未追跡として未解決へ
     for c in cands:
         rv = results.get(c["id"], {"attacks": []})
-        rv["provenance"] = provenance(run, cfg, "redteam", f"review_{c['id']}", target=c["id"])
+        rv["provenance"] = provenance(run, cfg, "redteam", f"{run['id']}__review_{c['id']}", target=c["id"])
         c["_review"] = rv
         write_json(run, f"reviews/{c['id']}.json", rv)
         todo = []
@@ -567,7 +586,7 @@ def revise(runner, cands, cfg, run):
     tmpl = load_prompt("revise")
 
     def one(c):
-        label = f"revise_{c['id']}"
+        label = f"{run['id']}__revise_{c['id']}"
         shown = {k: v for k, v in c.items()
                  if not k.startswith("_") and k not in ("provenance",)}
         prompt = render(tmpl,
@@ -745,7 +764,7 @@ def verify(runner, cands, cfg, run, mem):
         return sorted(set(missing))
 
     def one(c):
-        label = f"verify_{c['id']}"
+        label = f"{run['id']}__verify_{c['id']}"
         miss = form_ok(c)
         if miss:
             return c["id"], {"_form_fail": miss, "verdict": "kill",

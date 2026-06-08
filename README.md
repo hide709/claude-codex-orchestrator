@@ -63,7 +63,7 @@ orchestrator は engine を直接呼ばず、`queue/<engine>/inbox` に依頼を
 
 ### Windows での実際の動かし方(端末を分ける)
 1. **新しい PowerShell** を engine 数+1 だけ開く(Windows Terminal のタブでよい)。各タブで
-   `cd C:\Users\hide\Documents\work\orchestration`(dual のコードがあるブランチに居ること)。
+   `cd C:\path\to\claude-codex-orchestrator`(dual のコードがあるブランチに居ること)。
 2. **worker を立てる**(engine ごとに1タブ):
    ```powershell
    .\tools\start-worker.ps1 codex

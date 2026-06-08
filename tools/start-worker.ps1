@@ -27,7 +27,7 @@ $instr = @"
 1. queue/$Engine.alive に現在時刻を Write して heartbeat を更新する。
 2. queue/$Engine/inbox/*.json のうち、対応する queue/$Engine/reports/<同名>.json が無いものを探す。
 3. 各タスク {label, kind, schema, prompt} について、prompt に従い schema に厳密準拠した JSON だけを
-   queue/$Engine/reports/<同名>.json に Write する(説明文・コードフェンス禁止)。
+   まず queue/$Engine/reports/<同名>.json.tmp に Write し、完成後に queue/$Engine/reports/<同名>.json へ Rename/Move する(説明文・コードフェンス禁止)。
 4. 新しいタスクが来るまで 1 に戻って待機する。
 まず queue/$Engine.alive を更新し、『$Engine queue を見張っています』と一言だけ言ってから開始してください。
 "@
