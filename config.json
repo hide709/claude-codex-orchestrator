@@ -7,6 +7,7 @@
   "n_lenses": 4,
   "timeout_sec": 420,
   "lit_search_enabled": true,
+  "inspire_enabled": true,
   "lit_search_max_terms": 6,
   "lit_search_max_results": 5,
   "lit_search_timeout_sec": 15,
@@ -18,6 +19,7 @@
     "reasoning_effort": "minimal|low|medium|high|xhigh。MVP は速度/コスト優先で low。質を上げるなら medium+。",
     "service_tier": "ユーザの ~/.codex/config.toml が 'default' で CLI が壊れるため flex で上書きしている。",
     "n_lenses": "lenses の先頭から何個使うか(=生成する独立候補数)。",
-    "lit_search_enabled": "Tier0 novelty 用に arXiv API から候補文献を取得して evidence/*.arxiv.json に保存する。"
+    "lit_search_enabled": "Tier0 novelty 用に arXiv/INSPIRE から候補文献を取得し evidence/*.{arxiv,inspire}.json に保存(--no-lit-search で無効化)。",
+    "inspire_enabled": "INSPIRE-HEP(HEP の権威DB)検索の有効/無効。lit_search_enabled が false なら無視。"
   }
 }

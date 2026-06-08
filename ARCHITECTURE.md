@@ -145,6 +145,7 @@
   - 研究: 反証不能 / 完全な既出 / **保存則・proven定理に反する** / どんな現実的アクセスでも資源が届かない。
   - 実装: tests fail / forbidden file / 無断 public API 変更 / secrets 検出 / 無断 network・install / diff 過大(→human) / security 弱化。
 - **禁止:** **「通説・期待に反する」を kill しない。** それは高分散・高インパクトの種かもしれない → **残して flag**。kill するのは「証明に反する」場合のみ。
+- **LLM の verdict='kill' は『推奨』であって客観 reject ではない(実装上の分離):** 自動 reject するのは**形不備など決定的・客観的な基準のみ**。LLM が kill と判断した候補は落とさず `kill?(LLM/要確認)` として残し、人間が棄却の妥当性を判断(誤kill救済)。
 - **落選の扱い:** 消さずに **捨て案台帳** に保存(理由付き)。
 
 ### 3.7 ARBITER
