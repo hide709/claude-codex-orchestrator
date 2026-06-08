@@ -59,6 +59,16 @@ runs/<id>/
 - `decision_matrix.md` の `engine` 列・`REPORT.md` の「生成 engine 内訳」で、どちらが各候補を出したか分かる。
 - redteam / revise / verify は primary(非claude)engine で実行(queue を溢れさせない)。
 
+### Windows での実際の動かし方(2端末)
+1. **新しい PowerShell** を2つ開く(Windows Terminal のタブ2つでよい)。両方で
+   `cd C:\Users\hide\Documents\work\orchestration`(dual のコードがあるブランチに居ること)。
+2. **端末B(worker を立てる)**: `.\tools\start-claude-worker.ps1`
+   → `queue を見張っています` と出れば準備完了(対話セッション。`claude -p` 不使用 = 別料金なし)。
+3. **端末A(オーケストレータ)**: `python orchestrate.py --seed "あなたの問い"`
+   → `生成: N候補 (codex:.., claude:..)` で両エンジン稼働。
+- worker を立てたら **すぐ**端末A を回す(heartbeat の鮮度で生存判定。既定 120 秒)。
+- 終了は端末B を `Ctrl+C`。閉じれば次回は自動で codex のみ。
+
 配管だけ試す(トークン/常駐 Claude 不要):
 ```bash
 python tools/mock_claude_worker.py 60        # 別ターミナルで偽 worker(heartbeat + mock 応答)

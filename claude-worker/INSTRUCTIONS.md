@@ -5,15 +5,21 @@ orchestrator は **`claude -p` を使わない**(別料金)。代わりに **フ
 
 ## 起動(人間が一度だけ)
 
-1. 別ターミナルで、このリポジトリ root にいる Claude Code 対話セッションを1つ用意する
-   (subscription 内の対話セッション。**`claude -p` ではない**)。
-2. そのセッションに次を指示する:
-   > このリポジトリの `claude-worker/INSTRUCTIONS.md` に従い、queue worker として常駐して。
+**Windows(PowerShell)** — 新しいウィンドウ/タブで:
+```powershell
+cd C:\Users\hide\Documents\work\orchestration
+.\tools\start-claude-worker.ps1
+```
+これが対話セッション(**`claude -p` ではない**)を `--permission-mode acceptEdits` で起動し、queue 監視を指示する。
+`queue を見張っています` と出れば準備完了。
+
+**手動で起動する場合** — 新ターミナルで `claude` を起動し、次を貼る:
+> このリポジトリの `claude-worker/INSTRUCTIONS.md` に従い、queue worker として常駐して。
 
 ## worker のループ(Claude セッションがやること)
 
-1. **heartbeat**: 10〜20秒ごとに `queue/claude.alive` を更新(中身は任意。touch でよい)。
-   orchestrator はこの鮮度で「worker 稼働中」を判定する(古い/無ければ自動で codex に degrade)。
+1. **heartbeat**: ループ毎に `queue/claude.alive` に現在時刻を **Write**(acceptEdits なら無確認で書ける)。
+   orchestrator はこのファイルの新しさで「worker 稼働中」を判定する(既定 120 秒。古い/無ければ自動で codex に degrade)。
 2. **inbox を監視**: `queue/inbox/*.json` のうち、対応する `queue/reports/<label>.json` がまだ無いものを探す。
 3. 各タスク `{label, kind, schema, prompt}` について:
    - `prompt` に従い、**`schema` に厳密準拠した JSON だけ**を生成(説明文・コードフェンス禁止)。

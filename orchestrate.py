@@ -1039,7 +1039,7 @@ DEFAULT_CFG = {
     "eval_axes": ["novelty", "soundness", "feasibility", "significance"],
     "lit_search_enabled": True, "lit_search_max_terms": 6,
     "lit_search_max_results": 5, "lit_search_timeout_sec": 15, "inspire_enabled": True,
-    "claude_queue_poll_sec": 3, "claude_queue_timeout_sec": 600, "claude_heartbeat_stale_sec": 30,
+    "claude_queue_poll_sec": 3, "claude_queue_timeout_sec": 600, "claude_heartbeat_stale_sec": 120,
 }
 
 

@@ -9,7 +9,7 @@
   "timeout_sec": 420,
   "claude_queue_poll_sec": 3,
   "claude_queue_timeout_sec": 600,
-  "claude_heartbeat_stale_sec": 30,
+  "claude_heartbeat_stale_sec": 120,
   "lit_search_enabled": true,
   "inspire_enabled": true,
   "lit_search_max_terms": 6,
