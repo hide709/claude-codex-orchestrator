@@ -1,0 +1,18 @@
+{
+  "engine": "codex",
+  "model": "gpt-5.5",
+  "reasoning_effort": "low",
+  "service_tier": "flex",
+  "concurrency": 4,
+  "n_lenses": 4,
+  "timeout_sec": 420,
+  "lenses": ["analogy", "anomaly", "method-driven", "contrarian", "gap", "combination"],
+  "eval_axes": ["novelty", "soundness", "feasibility", "significance"],
+
+  "_comment": {
+    "engine": "codex | claude | mock。claude は CLI が PATH にあれば使える。mock はトークン無しで配管検証。",
+    "reasoning_effort": "minimal|low|medium|high|xhigh。MVP は速度/コスト優先で low。質を上げるなら medium+。",
+    "service_tier": "ユーザの ~/.codex/config.toml が 'default' で CLI が壊れるため flex で上書きしている。",
+    "n_lenses": "lenses の先頭から何個使うか(=生成する独立候補数)。"
+  }
+}

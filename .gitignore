@@ -1,0 +1,13 @@
+# 実行ごとの生成物(成果物・ログ。再現可能なので追跡しない)
+runs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
