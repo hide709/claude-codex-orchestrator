@@ -306,13 +306,13 @@ def load_prompt(name):
 def _read_jsonl(path):
     out = []
     if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             line = line.strip()
             if line:
                 try:
                     out.append(json.loads(line))
-                except Exception:
-                    pass
+                except json.JSONDecodeError as e:
+                    print(f"[memory] skip malformed JSONL: {path}:{lineno}: {e}", file=sys.stderr)
     return out
 
 
@@ -370,12 +370,13 @@ def _similarity(a, b):
     return len(A & B) / len(A | B)
 
 
-def mark_near_duplicates(cands, mem, threshold=0.5):
+def mark_near_duplicates(cands, mem, threshold=0.5, max_seen=500):
     """過去 run の候補と似ていれば印を付ける(重複『検知』のみ。落とさない)。"""
+    seen = mem["seen"][-max_seen:]
     for c in cands:
         text = c.get("question", "") + c.get("hypothesis", "")
         best_s, best = 0.0, None
-        for s in mem["seen"]:
+        for s in seen:
             sim = _similarity(text, s.get("question", "") + s.get("hypothesis", ""))
             if sim > best_s:
                 best_s, best = sim, s
@@ -396,7 +397,16 @@ def append_seen(run, cands):
             }, ensure_ascii=False) + "\n")
 
 
+def _safe_component(value, label):
+    text = str(value)
+    if not text or text in (".", "..") or any(sep in text for sep in ("/", "\\")):
+        raise ValueError(f"{label} にパス区切りや不正値は使えません: {value!r}")
+    return text
+
+
 def _load_candidate(run_id, cand_id):
+    run_id = _safe_component(run_id, "run_id")
+    cand_id = _safe_component(cand_id, "cand_id")
     base = ROOT / "runs" / run_id
     for sub in ("revised", "candidates"):
         p = base / sub / f"{cand_id}.json"
@@ -425,7 +435,11 @@ def cmd_memory(kind, argv):
     ap.add_argument("cand_id")
     ap.add_argument("--note", default="")
     a = ap.parse_args(argv)
-    c = _load_candidate(a.run_id, a.cand_id)
+    try:
+        c = _load_candidate(a.run_id, a.cand_id)
+    except ValueError as e:
+        print(e)
+        sys.exit(1)
     if not c:
         print(f"候補が見つからない: runs/{a.run_id}/(revised|candidates)/{a.cand_id}.json")
         sys.exit(1)
