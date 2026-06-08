@@ -456,7 +456,9 @@ def _search_terms(text, max_terms):
 def collect_prior_art(c, cfg, run):
     """Tier0 novelty の補助: arXiv API から候補文献を取り、artifact として残す。"""
     if not cfg.get("lit_search_enabled", True):
-        return {"enabled": False, "query": "", "results": [], "error": ""}
+        data = {"enabled": False, "query": "", "results": [], "error": ""}
+        write_json(run, f"evidence/{c['id']}.arxiv.json", data)
+        return data
 
     text = " ".join(str(c.get(k, "")) for k in
                     ("question", "hypothesis", "novelty_claim", "test_method"))
@@ -494,7 +496,7 @@ def collect_prior_art(c, cfg, run):
                     authors.append(name)
             data["results"].append({
                 "citation": f"{', '.join(authors)} ({published[:4]}), {title}",
-                "source_tier": "authoritative_db",
+                "source_tier": "preprint",  # arXiv はプレプリント(査読前)。INSPIRE/査読より下位
                 "relation": "arXiv search candidate; verifier must assess relation",
                 "url": arxiv_id,
             })
@@ -502,6 +504,68 @@ def collect_prior_art(c, cfg, run):
         data["error"] = str(e)
     write_json(run, f"evidence/{c['id']}.arxiv.json", data)
     return data
+
+
+def collect_inspire(c, cfg, run):
+    """Tier0 novelty 補助: INSPIRE-HEP(HEP の権威DB)から候補文献を取り artifact 化。"""
+    if not cfg.get("inspire_enabled", True):
+        data = {"enabled": False, "query": "", "results": [], "error": ""}
+        write_json(run, f"evidence/{c['id']}.inspire.json", data)
+        return data
+    text = " ".join(str(c.get(k, "")) for k in
+                    ("question", "hypothesis", "novelty_claim", "test_method"))
+    terms = _search_terms(text, int(cfg.get("lit_search_max_terms", 6)))
+    if not terms:
+        data = {"enabled": True, "query": "", "results": [], "error": "no_ascii_search_terms"}
+        write_json(run, f"evidence/{c['id']}.inspire.json", data)
+        return data
+    q = " ".join(terms[:5])  # INSPIRE は free-text。広すぎる OR を避け上位語のみ
+    params = urllib.parse.urlencode({
+        "q": q,
+        "size": int(cfg.get("lit_search_max_results", 5)),
+        "fields": "titles,authors.full_name,arxiv_eprints,earliest_date",
+        "sort": "mostrecent",
+    })
+    url = f"https://inspirehep.net/api/literature?{params}"
+    data = {"enabled": True, "query": q, "url": url, "results": [], "error": ""}
+    try:
+        timeout = int(cfg.get("lit_search_timeout_sec", 15))
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "claude-codex-orchestrator/0.1", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+        for hit in body.get("hits", {}).get("hits", []):
+            m = hit.get("metadata", {})
+            title = (m.get("titles") or [{}])[0].get("title", "")
+            authors = [a.get("full_name", "") for a in (m.get("authors") or [])[:5] if a.get("full_name")]
+            year = (m.get("earliest_date", "") or "")[:4]
+            eprint = (m.get("arxiv_eprints") or [{}])[0].get("value", "")
+            data["results"].append({
+                "citation": f"{', '.join(authors)} ({year}), {title}".strip(),
+                "source_tier": "authoritative_db",  # INSPIRE は査読・curated メタデータの権威DB
+                "relation": "INSPIRE-HEP search candidate; verifier must assess relation",
+                "url": (f"https://arxiv.org/abs/{eprint}" if eprint else ""),
+            })
+    except Exception as e:
+        data["error"] = str(e)
+    write_json(run, f"evidence/{c['id']}.inspire.json", data)
+    return data
+
+
+def collect_evidence(c, cfg, run):
+    """Tier0 novelty 補助の集約: arXiv(preprint) + INSPIRE-HEP(authoritative_db)。
+    §8 Read プレーン: 許可した read-only API のみ叩き、結果はスナップショット保存。"""
+    if not cfg.get("lit_search_enabled", True):
+        empty = {"enabled": False, "query": "", "results": [], "error": ""}
+        write_json(run, f"evidence/{c['id']}.arxiv.json", empty)
+        write_json(run, f"evidence/{c['id']}.inspire.json", empty)
+        return {"arxiv": empty, "inspire": empty}
+    return {"arxiv": collect_prior_art(c, cfg, run),
+            "inspire": collect_inspire(c, cfg, run)}
+
+
+def evidence_refs(c):
+    return [f"evidence/{c['id']}.arxiv.json", f"evidence/{c['id']}.inspire.json"]
 
 
 def verify(runner, cands, cfg, run):
@@ -524,7 +588,7 @@ def verify(runner, cands, cfg, run):
         if miss:
             return c["id"], {"_form_fail": miss, "verdict": "kill",
                              "kill_reason": f"形不備(必須欠落): {', '.join(miss)}"}
-        prior_art_hint = collect_prior_art(c, cfg, run)
+        prior_art_hint = collect_evidence(c, cfg, run)
         prompt = render(tmpl,
                         candidate=json.dumps({k: v for k, v in c.items() if not k.startswith("_")},
                                              ensure_ascii=False, indent=2),
@@ -534,17 +598,19 @@ def verify(runner, cands, cfg, run):
         try:
             verdict = runner.run(prompt, VERDICT_SCHEMA, "verdict", label, run["log"])
             verdict["provenance"] = provenance(run, cfg, "verify", label, target=c["id"])
-            verdict["evidence_refs"] = [f"evidence/{c['id']}.arxiv.json"]
+            verdict["evidence_refs"] = evidence_refs(c)
             return c["id"], verdict
         except Exception as e:
             log(run, f"  [verify {c['id']}] FAILED: {e}")
             return c["id"], {"verdict": "flag", "kill_reason": "",
-                             "notes": f"検証エラー(要再実行): {e}",
-                             "novelty": {"assessment": "未検証", "confidence": "low"},
-                             "soundness": {"assessment": "未検証", "confidence": "low"},
-                             "feasibility": {"assessment": "未検証", "confidence": "low"},
-                             "significance": {"assessment": "未検証", "confidence": "low"},
-                             "prior_art": []}
+                              "notes": f"検証エラー(要再実行): {e}",
+                              "novelty": {"assessment": "未検証", "confidence": "low"},
+                              "soundness": {"assessment": "未検証", "confidence": "low"},
+                              "feasibility": {"assessment": "未検証", "confidence": "low"},
+                              "significance": {"assessment": "未検証", "confidence": "low"},
+                              "prior_art": [],
+                              "provenance": provenance(run, cfg, "verify", label, target=c["id"]),
+                              "evidence_refs": evidence_refs(c)}
 
     verdicts = dict(_parallel(cfg, [(one, (c,)) for c in cands]))
     for c in cands:
@@ -554,23 +620,32 @@ def verify(runner, cands, cfg, run):
 
 
 def hard_gate(cands, run):
-    """kill を落として捨て案台帳へ(消さない)。survivors = keep/flag。"""
+    """**客観的な不備(形=必須欠落)だけ**を自動 reject。
+    LLM の verdict='kill' は『判断』であって客観事実ではないので落とさず、人間確認用に印を付けて
+    survivor に残す(ARCHITECTURE §3.6/§9: hard gate は客観のみ。AIに採用可否を裁かせない)。"""
     survivors, discarded = [], []
     for c in cands:
         v = c.get("_verdict", {})
-        if v.get("verdict") == "kill":
+        if v.get("_form_fail"):                       # 客観: 形不備のみ自動 reject
             discarded.append((c, v.get("kill_reason", "(理由未記載)")))
-        else:
-            survivors.append(c)
+            continue
+        if v.get("verdict") == "kill":                # LLM の kill = 推奨。落とさず人間確認へ
+            c["_llm_kill"] = True
+            c["_llm_kill_reason"] = v.get("kill_reason", "")
+        survivors.append(c)
+
     lines = ["# 捨て案台帳 (discarded)\n",
-             "hard gate で落ちた候補。**消さずに理由付きで残す**(ARCHITECTURE §3.6)。\n"]
+             "**客観的な不備(形=必須項目の欠落)のみ**を自動 reject(ARCHITECTURE §3.6)。消さずに理由付きで残す。",
+             "> LLM が kill 推奨した候補はここには入れない。`decision_matrix` に "
+             "`kill?(LLM/要確認)` として残し、人間が棄却の妥当性を判断する(誤kill救済)。\n"]
     for c, reason in discarded:
         lines += [f"## {c['id']}  (lens: {c.get('_lens','?')})",
-                  f"- 仮説: {c.get('hypothesis','')}", f"- 棄却理由: **{reason}**", ""]
+                  f"- 仮説: {c.get('hypothesis','')}", f"- 棄却理由(客観): **{reason}**", ""]
     if not discarded:
-        lines.append("_(今回 hard gate で落ちた候補は無し)_\n")
+        lines.append("_(今回 客観 hard gate で落ちた候補は無し)_\n")
     write_text(run, "discarded.md", "\n".join(lines))
-    log(run, f"  hard gate: 生存 {len(survivors)} / 棄却 {len(discarded)}")
+    n_llm_kill = sum(1 for c in survivors if c.get("_llm_kill"))
+    log(run, f"  hard gate: 生存 {len(survivors)}(内 LLM-kill推奨 {n_llm_kill}=要人間確認) / 客観棄却 {len(discarded)}")
     return survivors
 
 
@@ -586,17 +661,18 @@ def arbiter(survivors, run):
     rows = []
     for c in survivors:
         v = c.get("_verdict", {})
+        status = "kill?(LLM/要確認)" if c.get("_llm_kill") else v.get("verdict", "?")
         rows.append({
             "id": c["id"], "lens": c.get("_lens", "?"),
-            "verdict": v.get("verdict", "?"), "risk_type": c.get("risk_type", ""),
+            "verdict": status, "risk_type": c.get("risk_type", ""),
             "hypothesis": c.get("hypothesis", ""),
             "novelty": cell(v, "novelty"), "soundness": cell(v, "soundness"),
             "feasibility": cell(v, "feasibility"), "significance": cell(v, "significance"),
             "cheapest_kill": c.get("cheapest_kill", ""),
         })
-    # 透明な並べ替え: keep を先, 次に high/medium confidence の数(単一スコアには潰さない)
+    # 透明な並べ替え: keep→flag→kill?(LLM)。同順位は high/medium confidence 数(単一スコアに潰さない)
     def score(r):
-        order = {"keep": 0, "flag": 1}.get(r["verdict"], 2)
+        order = {"keep": 0, "flag": 1}.get(r["verdict"], 2)   # kill?(LLM/要確認) は 2
         strong = sum(("high" in r[a] or "medium" in r[a]) for a in
                      ("novelty", "soundness", "feasibility", "significance"))
         return (order, -strong)
@@ -606,6 +682,8 @@ def arbiter(survivors, run):
     md = ["# decision_matrix (人間が読む)\n",
           "**勝者は選んでいない。** AIは候補を出し客観検証しただけ。",
           "どの生存案に *実験予算* を割くかは人間が決める(ARCHITECTURE §3.7 / §5)。\n",
+          "verdict 凡例: `keep` / `flag`(通説違反など要注目で残す) / "
+          "`kill?(LLM/要確認)`=LLM は kill 推奨だが客観未確認 → 人間が棄却の妥当性を判断。\n",
           "| id | lens | verdict | risk | novelty | soundness | feasibility | significance | cheapest_kill |",
           "|---|---|---|---|---|---|---|---|---|"]
     for r in rows:
@@ -637,21 +715,24 @@ def report(charter, survivors, all_cands, run):
           f"- seed: **{charter['seed']}**",
           f"- constraints: {charter['constraints'] or '(なし)'}",
           f"- engine: {run['engine']} / model: {run['model']}",
-          f"- 生成 {len(all_cands)} / 生存 {len(survivors)} / 棄却 {len(all_cands)-len(survivors)}",
+          f"- 生成 {len(all_cands)} / 生存 {len(survivors)} / 客観棄却 {len(all_cands)-len(survivors)}"
+          + (f" / 内 LLM-kill推奨 {sum(1 for c in survivors if c.get('_llm_kill'))}(要人間確認)"
+             if any(c.get('_llm_kill') for c in survivors) else ""),
           f"- created: {run['created']}\n",
           "## 読み方",
           "1. `decision_matrix.md` … 生存候補を評価軸ごとに(単一スコアに潰さず)一覧。",
           "2. `candidates/*.json` … 各 Research Hypothesis Contract。",
           "3. `reviews/*.json` … red-team の攻撃(検証項目へ変換済み)。",
           "4. `revised/*.json` … red-team 後の改訂版。原案は `candidates/` に残る。",
-          "5. `evidence/*.json` … arXiv などから機械的に収集した検証補助データ。",
+          "5. `evidence/*.json` … arXiv(preprint)/INSPIRE-HEP(権威DB)から機械的に収集した検証補助データ。",
           "6. `verdicts/*.json` … Tier0 検証結果(novelty/soundness/feasibility + prior_art)。",
           "7. `discarded.md` … hard gate 落ち(理由付き)。 `unresolved.md` … 未解決・未追跡変種。",
           "",
           "## 次の一手(人間)",
           "- 生存案のうち `cheapest_kill` が安いものから Tier1(toy計算/既存データ再解析)に回す。",
-          "- prior_art の source_tier が低い novelty 判定は、権威DBで裏取りする。",
+          "- prior_art の source_tier が低い novelty 判定は、権威DB(INSPIRE等)で裏取りする。",
           "- flag(通説違反など)は消さず、面白い線として別途検討。",
+          "- `kill?(LLM/要確認)` は LLM の棄却理由が客観的に正しいか人間が確認(誤kill救済)。",
           ""]
     write_text(run, "REPORT.md", "\n".join(md))
 
@@ -710,7 +791,7 @@ DEFAULT_CFG = {
     "lenses": ["analogy", "anomaly", "method-driven", "contrarian", "gap", "combination"],
     "eval_axes": ["novelty", "soundness", "feasibility", "significance"],
     "lit_search_enabled": True, "lit_search_max_terms": 6,
-    "lit_search_max_results": 5, "lit_search_timeout_sec": 15,
+    "lit_search_max_results": 5, "lit_search_timeout_sec": 15, "inspire_enabled": True,
 }
 
 
@@ -735,6 +816,8 @@ def main():
     ap.add_argument("--config", default=str(ROOT / "config.json"))
     ap.add_argument("--engine", choices=["codex", "claude", "mock"], help="config を上書き")
     ap.add_argument("--n-lenses", type=int, help="使う発散レンズ数(config を上書き)")
+    ap.add_argument("--no-lit-search", action="store_true",
+                    help="文献検索(arXiv/INSPIRE)を無効化(offline/高速テスト用)")
     args = ap.parse_args()
 
     seed = args.seed or (Path(args.seed_file).read_text(encoding="utf-8").strip()
@@ -747,6 +830,8 @@ def main():
         cfg["engine"] = args.engine
     if args.n_lenses:
         cfg["n_lenses"] = args.n_lenses
+    if args.no_lit_search:
+        cfg["lit_search_enabled"] = False
 
     run = new_run(seed, cfg)
     runner = make_runner(cfg)

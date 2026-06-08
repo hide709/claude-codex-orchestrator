@@ -136,8 +136,8 @@
   - **候補同士を比較しない**(横断は ARBITER の仕事)。
   - **「良し悪し」を主観判定しない。** 測れる事実だけを出す。
   - **生成者と同一であってはならない**(Codex worker が自分用の Verifier/gate を設計するのは利益相反。gate は PLANNER/人間が事前固定)。
-- **重要(研究の新規性):** 文献チェックは AI の記憶でやらない。**実DB(INSPIRE-HEP / arXiv / Semantic Scholar / ADS) + 一般ウェブ検索** で検索する(幻覚引用・recall漏れを防ぐ)。一般ウェブは breadth/recall 用。**出典を tier 付けして evidence に記録**する:
-    - 権威DB(INSPIRE/arXiv) > 査読論文 > preprint > web/blog
+- **重要(研究の新規性):** 文献チェックは AI の記憶でやらない。**実DB(INSPIRE-HEP / Semantic Scholar / ADS) + arXiv + 一般ウェブ検索** で検索する(幻覚引用・recall漏れを防ぐ)。一般ウェブは breadth/recall 用。**出典を tier 付けして evidence に記録**する:
+    - 権威DB(INSPIRE等のcurated DB) > 査読論文 > preprint(arXiv等) > web/blog
     - 低 tier(blog 等)を単独で「先行研究が否定」などの反証扱いにしない。
 
 ### 3.6 HARD GATE
@@ -145,6 +145,7 @@
   - 研究: 反証不能 / 完全な既出 / **保存則・proven定理に反する** / どんな現実的アクセスでも資源が届かない。
   - 実装: tests fail / forbidden file / 無断 public API 変更 / secrets 検出 / 無断 network・install / diff 過大(→human) / security 弱化。
 - **禁止:** **「通説・期待に反する」を kill しない。** それは高分散・高インパクトの種かもしれない → **残して flag**。kill するのは「証明に反する」場合のみ。
+- **LLM の verdict='kill' は『推奨』であって客観 reject ではない(実装上の分離):** 自動 reject するのは**形不備など決定的・客観的な基準のみ**。LLM が kill と判断した候補は落とさず `kill?(LLM/要確認)` として残し、人間が棄却の妥当性を判断(誤kill救済)。
 - **落選の扱い:** 消さずに **捨て案台帳** に保存(理由付き)。
 
 ### 3.7 ARBITER
