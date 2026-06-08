@@ -149,95 +149,30 @@ def _launch(argv, stdin_text, timeout):
                           text=True, timeout=timeout, encoding="utf-8", errors="replace")
 
 
-def _resolve_codex(cfg):
-    """codex 実行ファイルを解決。Windows では PATH に無くデスクトップ版 bin に居ることがある。"""
-    cands = []
-    if cfg.get("codex_path"):
-        cands.append(Path(cfg["codex_path"]))
-    bins = Path.home() / "AppData" / "Local" / "OpenAI" / "Codex" / "bin"
-    cands += sorted(bins.glob("*/codex.exe"), key=lambda p: p.stat().st_mtime, reverse=True)
-    w = shutil.which("codex")
-    if w:
-        cands.append(Path(w))
-
-    seen = set()
-    for cand in cands:
-        key = str(cand).lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        try:
-            proc = _launch([str(cand), "--version"], None, 5)
-            if proc.returncode == 0:
-                return str(cand)
-        except Exception:
-            continue
-    if cands:
-        return str(cands[0])
-    return "codex"
-
-
-class CodexRunner:
-    def __init__(self, cfg):
-        self.cfg = cfg
-        self.exe = _resolve_codex(cfg)
-        print(f"[codex] using: {self.exe}")
-
-    def run(self, prompt, schema, kind, label, logdir):
-        schema_file = logdir / f"{label}.schema.json"
-        out_file = logdir / f"{label}.out.json"
-        schema_file.write_text(json.dumps(schema), encoding="utf-8")
-        argv = [
-            self.exe, "exec",
-            "-c", f"service_tier={self.cfg['service_tier']}",
-            "-c", f"model_reasoning_effort={self.cfg['reasoning_effort']}",
-            "-m", self.cfg["model"],
-            "--skip-git-repo-check", "-s", "read-only", "--ephemeral",
-            "--color", "never",
-            "--output-schema", str(schema_file),
-            "-o", str(out_file),
-            "-",  # prompt from stdin
-        ]
-        try:
-            proc = _launch(argv, prompt, self.cfg["timeout_sec"])
-        except subprocess.TimeoutExpired:
-            raise RunnerError(f"codex timeout ({self.cfg['timeout_sec']}s)")
-        (logdir / f"{label}.log.txt").write_text(
-            f"$ {' '.join(argv)}\nexit={proc.returncode}\n\n--- stdout ---\n{proc.stdout}\n"
-            f"\n--- stderr ---\n{proc.stderr}\n", encoding="utf-8")
-        raw = ""
-        if out_file.exists():
-            raw = out_file.read_text(encoding="utf-8", errors="replace")
-        if not raw.strip():
-            raw = proc.stdout
-        if proc.returncode != 0 and not raw.strip():
-            raise RunnerError(f"codex exit {proc.returncode}: {proc.stderr[:300]}")
-        return _extract_json(raw)
-
-
-def claude_worker_alive(cfg):
-    """常駐 Claude worker の heartbeat(queue/claude.alive)が新しいか。"""
-    hb = QUEUE_DIR / "claude.alive"
+def worker_alive(engine, cfg):
+    """常駐 worker の heartbeat(queue/<engine>.alive)が新しいか。"""
+    hb = QUEUE_DIR / f"{engine}.alive"
     if not hb.exists():
         return False
     try:
-        return (time.time() - hb.stat().st_mtime) < cfg.get("claude_heartbeat_stale_sec", 30)
+        return (time.time() - hb.stat().st_mtime) < cfg.get("heartbeat_stale_sec", 120)
     except Exception:
         return False
 
 
-class ClaudeRunner:
-    """**`claude -p` は使わない(別料金)。** program_creater 方式: ファイル queue 経由で、
-    別途起動した常駐 Claude セッションにタスクを渡し、報告ファイルを待つ。
-    常駐セッションの起動は claude-worker/INSTRUCTIONS.md を参照。"""
-    def __init__(self, cfg):
+class QueueRunner:
+    """**headless 呼び出し(codex exec / claude -p)はしない。** program_creater / Shogun 方式:
+    engine ごとに別途起動した**常駐セッション**へ、ファイル queue 経由でタスクを渡し報告を待つ。
+    codex も claude も同じ仕組みに統一(起動は tools/start-worker.ps1 <engine>)。"""
+    def __init__(self, engine, cfg):
+        self.engine = engine
         self.cfg = cfg
-        self.qin = QUEUE_DIR / "inbox"
-        self.qout = QUEUE_DIR / "reports"
+        self.qin = QUEUE_DIR / engine / "inbox"
+        self.qout = QUEUE_DIR / engine / "reports"
         self.qin.mkdir(parents=True, exist_ok=True)
         self.qout.mkdir(parents=True, exist_ok=True)
-        self.poll = cfg.get("claude_queue_poll_sec", 3)
-        self.timeout = cfg.get("claude_queue_timeout_sec", cfg.get("timeout_sec", 420))
+        self.poll = cfg.get("queue_poll_sec", 3)
+        self.timeout = cfg.get("queue_timeout_sec", cfg.get("timeout_sec", 600))
 
     def run(self, prompt, schema, kind, label, logdir):
         inbox_f = self.qin / f"{label}.json"
@@ -252,12 +187,12 @@ class ClaudeRunner:
             if report_f.exists():
                 raw = report_f.read_text(encoding="utf-8", errors="replace")
                 (logdir / f"{label}.log.txt").write_text(
-                    f"[claude-queue] {label}\n--- report ---\n{raw}", encoding="utf-8")
+                    f"[{self.engine}-queue] {label}\n--- report ---\n{raw}", encoding="utf-8")
                 return _extract_json(raw)
             time.sleep(self.poll)
             waited += self.poll
-        raise RunnerError(f"claude queue timeout ({self.timeout}s): "
-                          "常駐 Claude worker が稼働しているか確認(claude-worker/INSTRUCTIONS.md)")
+        raise RunnerError(f"{self.engine} queue timeout ({self.timeout}s): "
+                          f"常駐 {self.engine} worker が稼働しているか確認(tools/start-worker.ps1 {self.engine})")
 
 
 class MockRunner:
@@ -308,17 +243,14 @@ class MockRunner:
 
 
 def make_runner_for(engine, cfg):
-    return {"codex": CodexRunner, "claude": ClaudeRunner, "mock": MockRunner}[engine](cfg)
+    if engine == "mock":
+        return MockRunner(cfg)
+    return QueueRunner(engine, cfg)   # codex / claude を常駐+queue に統一(headless 廃止)
 
 
-def make_runner(cfg):
-    """単一 engine 用(redteam/revise/verify が使う primary)。dual は generate 内で engine 別に生成。
-    primary は最初の非claude engine(queue を使わない側= redteam/verify を止めない)。"""
-    eng = cfg["engine"]
-    if eng != "dual":
-        return make_runner_for(eng, cfg)
-    prim = next((e for e in cfg.get("engines", ["codex"]) if e != "claude"), "codex")
-    return make_runner_for(prim, cfg)
+def usable_engines(engines, cfg):
+    """使える engine を順序保持で返す。mock は常に可、それ以外は常駐 worker が生存している場合のみ。"""
+    return [e for e in engines if e == "mock" or worker_alive(e, cfg)]
 
 
 # ----------------------------------------------------------------------------
@@ -538,12 +470,9 @@ def generate(runner, charter, cfg, run, mem):
     lenses = charter["lenses"]
     digest = memory_digest(mem)
 
-    engines = list(charter.get("engines") or [cfg["engine"]])
-    # 常駐 Claude worker が居なければ claude を外して degrade(タイムアウト待ちを避ける)
-    if "claude" in engines and not claude_worker_alive(cfg):
-        engines = [e for e in engines if e != "claude"] or ["codex"]
-        log(run, "  注意: 常駐 Claude worker 未稼働 → この run は claude を外す(codex へ degrade)")
+    engines = list(charter.get("engines") or ["mock"])   # main で live なものに絞り済み
     assign = [engines[i % len(engines)] for i in range(len(lenses))]
+    fallback = engines[0]
 
     runner_cache = {}
 
@@ -562,13 +491,13 @@ def generate(runner, charter, cfg, run, mem):
         try:
             data = get_runner(eng).run(prompt, HYPOTHESIS_SCHEMA, "hypothesis", label, run["log"])
         except Exception as e:
-            if eng != "codex":   # claude 等が落ちたら codex にフォールバック(default を壊さない)
-                log(run, f"  [gen {lens}] {eng} 失敗({e}) → codex で再試行")
+            if eng != fallback:   # 失敗したら別の live engine にフォールバック
+                log(run, f"  [gen {lens}] {eng} 失敗({e}) → {fallback} で再試行")
                 try:
-                    data = get_runner("codex").run(prompt, HYPOTHESIS_SCHEMA, "hypothesis", label, run["log"])
-                    used = f"codex(fallback<{eng})"
+                    data = get_runner(fallback).run(prompt, HYPOTHESIS_SCHEMA, "hypothesis", label, run["log"])
+                    used = f"{fallback}(fallback<{eng})"
                 except Exception as e2:
-                    log(run, f"  [gen {lens}] codex も失敗: {e2}")
+                    log(run, f"  [gen {lens}] {fallback} も失敗: {e2}")
                     return None
             else:
                 log(run, f"  [gen {lens}] FAILED: {e}")
@@ -1039,7 +968,7 @@ DEFAULT_CFG = {
     "eval_axes": ["novelty", "soundness", "feasibility", "significance"],
     "lit_search_enabled": True, "lit_search_max_terms": 6,
     "lit_search_max_results": 5, "lit_search_timeout_sec": 15, "inspire_enabled": True,
-    "claude_queue_poll_sec": 3, "claude_queue_timeout_sec": 600, "claude_heartbeat_stale_sec": 120,
+    "queue_poll_sec": 3, "queue_timeout_sec": 600, "heartbeat_stale_sec": 120,
 }
 
 
@@ -1066,7 +995,7 @@ def main():
     ap.add_argument("--seed-file", help="種をファイルから読む")
     ap.add_argument("--constraints", default="", help="制約(使える装置/データ/計算資源 等)")
     ap.add_argument("--config", default=str(ROOT / "config.json"))
-    ap.add_argument("--engine", choices=["codex", "claude", "mock"], help="config を上書き")
+    ap.add_argument("--engine", choices=["dual", "codex", "claude", "mock"], help="config を上書き")
     ap.add_argument("--n-lenses", type=int, help="使う発散レンズ数(config を上書き)")
     ap.add_argument("--no-lit-search", action="store_true",
                     help="文献検索(arXiv/INSPIRE)を無効化(offline/高速テスト用)")
@@ -1091,15 +1020,26 @@ def main():
         cfg["engine"] = "dual" if len(es) > 1 else (es[0] if es else cfg["engine"])
 
     run = new_run(seed, cfg)
-    runner = make_runner(cfg)
     mem = load_memory()
-    print(f"\n=== RUN {run['id']}  (engine={cfg['engine']}, model={cfg['model']}) ===")
+    print(f"\n=== RUN {run['id']}  (engine={cfg['engine']}) ===")
     print(f"seed: {seed}")
     print(f"memory: 既出候補 {len(mem['seen'])} / 決定 {len(mem['decisions'])} / "
           f"好み {'有' if mem['preferences'] else '無'}\n")
 
     log(run, "[1/7] PLANNER  — charter 固定")
     charter = planner(seed, args.constraints, cfg, run)
+    # 使える engine(常駐 worker が生きているもの。mock は常に可)を確定
+    live = usable_engines(charter["engines"], cfg)
+    if not live:
+        print(f"使える engine がありません(要求: {charter['engines']})。codex/claude は headless を廃止したので常駐 worker が必要。")
+        print("  worker を立てる(別 PowerShell): .\\tools\\start-worker.ps1 codex  /  .\\tools\\start-worker.ps1 claude")
+        print("  配管だけ確認するなら: --engine mock")
+        sys.exit(1)
+    if live != list(charter["engines"]):
+        log(run, f"  注意: worker 未稼働を除外 → 使用 engine {live}(要求 {charter['engines']})")
+    charter["engines"] = live
+    runner = make_runner_for(live[0], cfg)   # primary(redteam/revise/verify 用)
+
     log(run, "[2/7] GENERATE — 発散(独立・並列・memory反映)")
     cands = generate(runner, charter, cfg, run, mem)
     if not cands:
