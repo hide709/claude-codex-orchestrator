@@ -4,6 +4,9 @@ runs/
 # 自動メモリ(重複検知用の使い捨てキャッシュ。decisions.jsonl/preferences.md は追跡する)
 memory/seen.jsonl
 
+# Claude worker 連携の queue(使い捨て。常駐セッションとのファイル受け渡し)
+queue/
+
 # Python
 __pycache__/
 *.pyc

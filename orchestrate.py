@@ -12,7 +12,7 @@ orchestrate.py — IDEA-stage funnel MVP   (see ARCHITECTURE.md §11)
   - VERIFIER は生成者と別呼び出し(独立)。red-team は judge しない(attack -> convert)。
   - soft score を単一値に潰さない。落選は捨て案台帳へ(消さない)。
 
-依存: Python 標準ライブラリのみ。engine は codex CLI(claude は CLI があれば差し替え可)。
+依存: Python 標準ライブラリのみ。engine は常駐 worker + queue 経由で呼ぶ。
 """
 
 import argparse
@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -32,6 +33,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 PROMPTS_DIR = ROOT / "prompts"
 MEMORY_DIR = ROOT / "memory"
+QUEUE_DIR = ROOT / "queue"
 
 # ----------------------------------------------------------------------------
 # 発散レンズ (ARCHITECTURE §3.3 / 研究向け)
@@ -147,89 +149,67 @@ def _launch(argv, stdin_text, timeout):
                           text=True, timeout=timeout, encoding="utf-8", errors="replace")
 
 
-def _resolve_codex(cfg):
-    """codex 実行ファイルを解決。Windows では PATH に無くデスクトップ版 bin に居ることがある。"""
-    cands = []
-    if cfg.get("codex_path"):
-        cands.append(Path(cfg["codex_path"]))
-    bins = Path.home() / "AppData" / "Local" / "OpenAI" / "Codex" / "bin"
-    cands += sorted(bins.glob("*/codex.exe"), key=lambda p: p.stat().st_mtime, reverse=True)
-    w = shutil.which("codex")
-    if w:
-        cands.append(Path(w))
-
-    seen = set()
-    for cand in cands:
-        key = str(cand).lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        try:
-            proc = _launch([str(cand), "--version"], None, 5)
-            if proc.returncode == 0:
-                return str(cand)
-        except Exception:
-            continue
-    if cands:
-        return str(cands[0])
-    return "codex"
+def worker_alive(engine, cfg):
+    """常駐 worker の heartbeat(queue/<engine>.alive)が新しいか。"""
+    hb = QUEUE_DIR / f"{engine}.alive"
+    if not hb.exists():
+        return False
+    try:
+        return (time.time() - hb.stat().st_mtime) < cfg.get("heartbeat_stale_sec", 120)
+    except Exception:
+        return False
 
 
-class CodexRunner:
-    def __init__(self, cfg):
+class QueueRunner:
+    """**headless 呼び出し(codex exec / claude -p)はしない。** program_creater / Shogun 方式:
+    engine ごとに別途起動した**常駐セッション**へ、ファイル queue 経由でタスクを渡し報告を待つ。
+    codex も claude も同じ仕組みに統一(起動は tools/start-worker.ps1 <engine>)。"""
+    def __init__(self, engine, cfg):
+        self.engine = engine
         self.cfg = cfg
-        self.exe = _resolve_codex(cfg)
-        print(f"[codex] using: {self.exe}")
+        self.qin = QUEUE_DIR / engine / "inbox"
+        self.qout = QUEUE_DIR / engine / "reports"
+        self.qin.mkdir(parents=True, exist_ok=True)
+        self.qout.mkdir(parents=True, exist_ok=True)
+        self.poll = cfg.get("queue_poll_sec", 3)
+        self.timeout = cfg.get("queue_timeout_sec", cfg.get("timeout_sec", 600))
 
     def run(self, prompt, schema, kind, label, logdir):
-        schema_file = logdir / f"{label}.schema.json"
-        out_file = logdir / f"{label}.out.json"
-        schema_file.write_text(json.dumps(schema), encoding="utf-8")
-        argv = [
-            self.exe, "exec",
-            "-c", f"service_tier={self.cfg['service_tier']}",
-            "-c", f"model_reasoning_effort={self.cfg['reasoning_effort']}",
-            "-m", self.cfg["model"],
-            "--skip-git-repo-check", "-s", "read-only", "--ephemeral",
-            "--color", "never",
-            "--output-schema", str(schema_file),
-            "-o", str(out_file),
-            "-",  # prompt from stdin
-        ]
+        if not worker_alive(self.engine, self.cfg):
+            raise RunnerError(f"{self.engine} worker heartbeat が無い/古い: "
+                              f"tools/start-worker.ps1 {self.engine} で常駐 worker を起動してください")
+        inbox_f = self.qin / f"{label}.json"
+        report_f = self.qout / f"{label}.json"
+        tmp_f = self.qin / f".{label}.{os.getpid()}.tmp"
+        if report_f.exists():
+            report_f.unlink()
+        payload = json.dumps(
+            {"label": label, "kind": kind, "schema": schema, "prompt": prompt, "created": _now()},
+            ensure_ascii=False, indent=2)
+        tmp_f.write_text(payload, encoding="utf-8")
+        tmp_f.replace(inbox_f)
+        waited = 0
+        while waited < self.timeout:
+            if report_f.exists():
+                raw = report_f.read_text(encoding="utf-8", errors="replace")
+                (logdir / f"{label}.log.txt").write_text(
+                    f"[{self.engine}-queue] {label}\n--- report ---\n{raw}", encoding="utf-8")
+                try:
+                    return _extract_json(raw)
+                finally:
+                    for p in (inbox_f, report_f):
+                        try:
+                            p.unlink()
+                        except FileNotFoundError:
+                            pass
+            time.sleep(self.poll)
+            waited += self.poll
         try:
-            proc = _launch(argv, prompt, self.cfg["timeout_sec"])
-        except subprocess.TimeoutExpired:
-            raise RunnerError(f"codex timeout ({self.cfg['timeout_sec']}s)")
-        (logdir / f"{label}.log.txt").write_text(
-            f"$ {' '.join(argv)}\nexit={proc.returncode}\n\n--- stdout ---\n{proc.stdout}\n"
-            f"\n--- stderr ---\n{proc.stderr}\n", encoding="utf-8")
-        raw = ""
-        if out_file.exists():
-            raw = out_file.read_text(encoding="utf-8", errors="replace")
-        if not raw.strip():
-            raw = proc.stdout
-        if proc.returncode != 0 and not raw.strip():
-            raise RunnerError(f"codex exit {proc.returncode}: {proc.stderr[:300]}")
-        return _extract_json(raw)
-
-
-class ClaudeRunner:
-    """claude CLI があれば使う。無ければ明示エラー(設計 §12: 後から差し替え可能)。"""
-    def __init__(self, cfg):
-        self.cfg = cfg
-        self.exe = shutil.which("claude")
-
-    def run(self, prompt, schema, kind, label, logdir):
-        if not self.exe:
-            raise RunnerError("claude CLI が PATH に無い。config.engine を 'codex' にするか CLI を入れて下さい。")
-        sys_p = ("出力は指定 JSON スキーマに厳密に従い、JSON のみを返す:\n"
-                 + json.dumps(schema))
-        argv = [self.exe, "-p", prompt, "--output-format", "json",
-                "--append-system-prompt", sys_p]
-        proc = _launch(argv, None, self.cfg["timeout_sec"])
-        (logdir / f"{label}.log.txt").write_text(proc.stdout + "\n" + proc.stderr, encoding="utf-8")
-        data = json.loads(proc.stdout)
-        return _extract_json(data.get("result", proc.stdout))
+            inbox_f.unlink()
+        except FileNotFoundError:
+            pass
+        raise RunnerError(f"{self.engine} queue timeout ({self.timeout}s): "
+                          f"常駐 {self.engine} worker が稼働しているか確認(tools/start-worker.ps1 {self.engine})")
 
 
 class MockRunner:
@@ -279,8 +259,15 @@ class MockRunner:
         raise RunnerError(f"unknown kind {kind}")
 
 
-def make_runner(cfg):
-    return {"codex": CodexRunner, "claude": ClaudeRunner, "mock": MockRunner}[cfg["engine"]](cfg)
+def make_runner_for(engine, cfg):
+    if engine == "mock":
+        return MockRunner(cfg)
+    return QueueRunner(engine, cfg)   # codex / claude を常駐+queue に統一(headless 廃止)
+
+
+def usable_engines(engines, cfg):
+    """使える engine を順序保持で返す。mock は常に可、それ以外は常駐 worker が生存している場合のみ。"""
+    return [e for e in engines if e == "mock" or worker_alive(e, cfg)]
 
 
 # ----------------------------------------------------------------------------
@@ -460,6 +447,8 @@ def planner(seed, constraints, cfg, run):
         "constraints": constraints,
         "eval_axes": cfg["eval_axes"],
         "lenses": cfg["lenses"][: cfg["n_lenses"]],
+        "engines": (cfg.get("engines", ["codex", "claude"]) if cfg["engine"] == "dual"
+                    else [cfg["engine"]]),
         "lit_search_enabled": cfg.get("lit_search_enabled", True),
         "rounds": 1,
         "created": run["created"],
@@ -492,25 +481,51 @@ def provenance(run, cfg, stage, label, **extra):
 
 
 def generate(runner, charter, cfg, run, mem):
-    """発散: レンズごとに独立生成(互いを見ない)。並列。memory で重複回避・好み反映。"""
+    """発散: レンズごとに独立生成(互いを見ない)。並列。memory で重複回避・好み反映。
+    engines が複数なら engine をレンズに割り当てる(Codex + Claude Code 両方 = default)。"""
     tmpl = load_prompt("ideator")
     lenses = charter["lenses"]
     digest = memory_digest(mem)
 
+    engines = list(charter.get("engines") or ["mock"])   # main で live なものに絞り済み
+    assign = [engines[i % len(engines)] for i in range(len(lenses))]
+    fallback = engines[0]
+
+    runner_cache = {}
+
+    def get_runner(eng):
+        if eng not in runner_cache:
+            runner_cache[eng] = make_runner_for(eng, cfg)
+        return runner_cache[eng]
+
     def one(i, lens):
-        label = f"gen_{i:02d}__{lens}"
+        label = f"{run['id']}__gen_{i:02d}__{lens}"
+        eng = assign[i]
         prompt = render(tmpl, seed=charter["seed"], constraints=charter["constraints"],
                         lens=lens, lens_desc=LENS_DESC.get(lens, lens), memory=digest,
                         schema=json.dumps(HYPOTHESIS_SCHEMA, ensure_ascii=False))
+        used = eng
+        used_label = label
         try:
-            data = runner.run(prompt, HYPOTHESIS_SCHEMA, "hypothesis", label, run["log"])
-            data["id"] = f"rq-{i:02d}"
-            data["_lens"] = lens
-            data["provenance"] = provenance(run, cfg, "generate", label, lens=lens)
-            return data
+            data = get_runner(eng).run(prompt, HYPOTHESIS_SCHEMA, "hypothesis", label, run["log"])
         except Exception as e:
-            log(run, f"  [gen {lens}] FAILED: {e}")
-            return None
+            if eng != fallback:   # 失敗したら別の live engine にフォールバック
+                log(run, f"  [gen {lens}] {eng} 失敗({e}) → {fallback} で再試行")
+                try:
+                    used_label = f"{label}__fallback_{fallback}"
+                    data = get_runner(fallback).run(prompt, HYPOTHESIS_SCHEMA, "hypothesis", used_label, run["log"])
+                    used = f"{fallback}(fallback<{eng})"
+                except Exception as e2:
+                    log(run, f"  [gen {lens}] {fallback} も失敗: {e2}")
+                    return None
+            else:
+                log(run, f"  [gen {lens}] FAILED: {e}")
+                return None
+        data["id"] = f"rq-{i:02d}"
+        data["_lens"] = lens
+        data["_engine"] = used
+        data["provenance"] = provenance(run, cfg, "generate", used_label, lens=lens, engine=used)
+        return data
 
     cands = _parallel(cfg, [(one, (i, lens)) for i, lens in enumerate(lenses)])
     cands = [c for c in cands if c]
@@ -518,7 +533,11 @@ def generate(runner, charter, cfg, run, mem):
     for c in cands:
         write_json(run, f"candidates/{c['id']}.json", c)
     ndup = sum(1 for c in cands if c.get("_near_dup"))
-    log(run, f"  生成: {len(cands)}/{len(lenses)} 候補" +
+    by_eng = {}
+    for c in cands:
+        by_eng[c.get("_engine", "?")] = by_eng.get(c.get("_engine", "?"), 0) + 1
+    breakdown = ", ".join(f"{k}:{v}" for k, v in sorted(by_eng.items()))
+    log(run, f"  生成: {len(cands)}/{len(lenses)} 候補 ({breakdown})" +
         (f" / 過去と類似 {ndup}件(重複注意)" if ndup else ""))
     return cands
 
@@ -528,7 +547,7 @@ def redteam(runner, cands, cfg, run):
     tmpl = load_prompt("redteam")
 
     def one(c):
-        label = f"review_{c['id']}"
+        label = f"{run['id']}__review_{c['id']}"
         # blind: 著者(レンズ)情報は渡さない
         shown = {k: v for k, v in c.items()
                  if not k.startswith("_") and k not in ("id", "provenance")}
@@ -544,7 +563,7 @@ def redteam(runner, cands, cfg, run):
     variants = []        # stronger_variant: 未追跡として未解決へ
     for c in cands:
         rv = results.get(c["id"], {"attacks": []})
-        rv["provenance"] = provenance(run, cfg, "redteam", f"review_{c['id']}", target=c["id"])
+        rv["provenance"] = provenance(run, cfg, "redteam", f"{run['id']}__review_{c['id']}", target=c["id"])
         c["_review"] = rv
         write_json(run, f"reviews/{c['id']}.json", rv)
         todo = []
@@ -567,7 +586,7 @@ def revise(runner, cands, cfg, run):
     tmpl = load_prompt("revise")
 
     def one(c):
-        label = f"revise_{c['id']}"
+        label = f"{run['id']}__revise_{c['id']}"
         shown = {k: v for k, v in c.items()
                  if not k.startswith("_") and k not in ("provenance",)}
         prompt = render(tmpl,
@@ -578,6 +597,7 @@ def revise(runner, cands, cfg, run):
             data = runner.run(prompt, HYPOTHESIS_SCHEMA, "hypothesis", label, run["log"])
             data["id"] = c["id"]
             data["_lens"] = c.get("_lens", "?")
+            data["_engine"] = c.get("_engine", "?")   # 生成 engine の印を改訂後にも引き継ぐ
             data["_review"] = c.get("_review", {"attacks": []})
             data["_verify_todo"] = c.get("_verify_todo", [])
             if c.get("_near_dup"):
@@ -744,7 +764,7 @@ def verify(runner, cands, cfg, run, mem):
         return sorted(set(missing))
 
     def one(c):
-        label = f"verify_{c['id']}"
+        label = f"{run['id']}__verify_{c['id']}"
         miss = form_ok(c)
         if miss:
             return c["id"], {"_form_fail": miss, "verdict": "kill",
@@ -828,7 +848,7 @@ def arbiter(survivors, run):
         v = c.get("_verdict", {})
         status = "kill?(LLM/要確認)" if c.get("_llm_kill") else v.get("verdict", "?")
         rows.append({
-            "id": c["id"], "lens": c.get("_lens", "?"),
+            "id": c["id"], "lens": c.get("_lens", "?"), "engine": c.get("_engine", "?"),
             "verdict": status, "risk_type": c.get("risk_type", ""),
             "hypothesis": c.get("hypothesis", ""),
             "novelty": cell(v, "novelty"), "soundness": cell(v, "soundness"),
@@ -849,10 +869,10 @@ def arbiter(survivors, run):
           "どの生存案に *実験予算* を割くかは人間が決める(ARCHITECTURE §3.7 / §5)。\n",
           "verdict 凡例: `keep` / `flag`(通説違反など要注目で残す) / "
           "`kill?(LLM/要確認)`=LLM は kill 推奨だが客観未確認 → 人間が棄却の妥当性を判断。\n",
-          "| id | lens | verdict | risk | novelty | soundness | feasibility | significance | cheapest_kill |",
-          "|---|---|---|---|---|---|---|---|---|"]
+          "| id | lens | engine | verdict | risk | novelty | soundness | feasibility | significance | cheapest_kill |",
+          "|---|---|---|---|---|---|---|---|---|---|"]
     for r in rows:
-        md.append("| {id} | {lens} | {verdict} | {risk_type} | {novelty} | {soundness} | "
+        md.append("| {id} | {lens} | {engine} | {verdict} | {risk_type} | {novelty} | {soundness} | "
                   "{feasibility} | {significance} | {cheapest_kill} |".format(
                       **{k: str(v).replace("|", "/").replace("\n", " ") for k, v in r.items()}))
     md.append("\n## 各候補の仮説\n")
@@ -876,10 +896,14 @@ def write_unresolved(cands, run):
 
 
 def report(charter, survivors, all_cands, run):
+    _eng = {}
+    for c in all_cands:
+        _eng[c.get("_engine", "?")] = _eng.get(c.get("_engine", "?"), 0) + 1
+    eng_bd = ", ".join(f"{k}:{v}" for k, v in sorted(_eng.items())) or "-"
     md = [f"# RUN REPORT — {run['id']}\n",
           f"- seed: **{charter['seed']}**",
           f"- constraints: {charter['constraints'] or '(なし)'}",
-          f"- engine: {run['engine']} / model: {run['model']}",
+          f"- engine: {run['engine']} / model: {run['model']}  (生成 engine 内訳: {eng_bd})",
           f"- 生成 {len(all_cands)} / 生存 {len(survivors)} / 客観棄却 {len(all_cands)-len(survivors)}"
           + (f" / 内 LLM-kill推奨 {sum(1 for c in survivors if c.get('_llm_kill'))}(要人間確認)"
              if any(c.get('_llm_kill') for c in survivors) else ""),
@@ -957,12 +981,13 @@ def log(run, msg):
 # main
 # ----------------------------------------------------------------------------
 DEFAULT_CFG = {
-    "engine": "codex", "model": "gpt-5.5", "reasoning_effort": "low",
+    "engine": "dual", "engines": ["codex", "claude"], "model": "gpt-5.5", "reasoning_effort": "low",
     "service_tier": "flex", "concurrency": 4, "n_lenses": 4, "timeout_sec": 420,
     "lenses": ["analogy", "anomaly", "method-driven", "contrarian", "gap", "combination"],
     "eval_axes": ["novelty", "soundness", "feasibility", "significance"],
     "lit_search_enabled": True, "lit_search_max_terms": 6,
     "lit_search_max_results": 5, "lit_search_timeout_sec": 15, "inspire_enabled": True,
+    "queue_poll_sec": 3, "queue_timeout_sec": 600, "heartbeat_stale_sec": 120,
 }
 
 
@@ -989,10 +1014,11 @@ def main():
     ap.add_argument("--seed-file", help="種をファイルから読む")
     ap.add_argument("--constraints", default="", help="制約(使える装置/データ/計算資源 等)")
     ap.add_argument("--config", default=str(ROOT / "config.json"))
-    ap.add_argument("--engine", choices=["codex", "claude", "mock"], help="config を上書き")
+    ap.add_argument("--engine", choices=["dual", "codex", "claude", "mock"], help="config を上書き")
     ap.add_argument("--n-lenses", type=int, help="使う発散レンズ数(config を上書き)")
     ap.add_argument("--no-lit-search", action="store_true",
                     help="文献検索(arXiv/INSPIRE)を無効化(offline/高速テスト用)")
+    ap.add_argument("--engines", help='生成 engine をカンマ区切りで上書き(例: "codex,claude" / "codex")')
     args = ap.parse_args()
 
     seed = args.seed or (Path(args.seed_file).read_text(encoding="utf-8").strip()
@@ -1007,17 +1033,32 @@ def main():
         cfg["n_lenses"] = args.n_lenses
     if args.no_lit_search:
         cfg["lit_search_enabled"] = False
+    if args.engines:
+        es = [e.strip() for e in args.engines.split(",") if e.strip()]
+        cfg["engines"] = es
+        cfg["engine"] = "dual" if len(es) > 1 else (es[0] if es else cfg["engine"])
 
     run = new_run(seed, cfg)
-    runner = make_runner(cfg)
     mem = load_memory()
-    print(f"\n=== RUN {run['id']}  (engine={cfg['engine']}, model={cfg['model']}) ===")
+    print(f"\n=== RUN {run['id']}  (engine={cfg['engine']}) ===")
     print(f"seed: {seed}")
     print(f"memory: 既出候補 {len(mem['seen'])} / 決定 {len(mem['decisions'])} / "
           f"好み {'有' if mem['preferences'] else '無'}\n")
 
     log(run, "[1/7] PLANNER  — charter 固定")
     charter = planner(seed, args.constraints, cfg, run)
+    # 使える engine(常駐 worker が生きているもの。mock は常に可)を確定
+    live = usable_engines(charter["engines"], cfg)
+    if not live:
+        print(f"使える engine がありません(要求: {charter['engines']})。codex/claude は headless を廃止したので常駐 worker が必要。")
+        print("  worker を立てる(別 PowerShell): .\\tools\\start-worker.ps1 codex  /  .\\tools\\start-worker.ps1 claude")
+        print("  配管だけ確認するなら: --engine mock")
+        sys.exit(1)
+    if live != list(charter["engines"]):
+        log(run, f"  注意: worker 未稼働を除外 → 使用 engine {live}(要求 {charter['engines']})")
+    charter["engines"] = live
+    runner = make_runner_for(live[0], cfg)   # primary(redteam/revise/verify 用)
+
     log(run, "[2/7] GENERATE — 発散(独立・並列・memory反映)")
     cands = generate(runner, charter, cfg, run, mem)
     if not cands:
