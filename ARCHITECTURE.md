@@ -343,10 +343,11 @@ attacks:
 1. 研究者が **seed(問い or hunch) + 制約(使える装置/データ/計算資源)** を入力。
 2. 複数 worker が**発散レンズ**で候補仮説を N 個生成(独立)。
 3. **RED-TEAM** が攻撃 → 検証可能項目に変換。
-4. **VERIFIER** が Tier 0 を実行: 検索で新規性(実DB) / Codex で桁見積もり・toy / Claude で soundness。
-5. Research Hypothesis Contract に成果物化、hard gate で死んだ線を落とす。
-6. **decision_matrix**(新規性・feasibility・cheapest_kill 付き)で研究者に提示。
-7. 研究者が深掘り対象に**探索予算を配分**。
+4. 攻撃を受けて候補を **1回だけ revise** する(原案は保存)。
+5. **VERIFIER** が Tier 0 を実行: 検索で新規性(実DB) / Codex で桁見積もり・toy / Claude で soundness。
+6. Research Hypothesis Contract に成果物化、hard gate で死んだ線を落とす。
+7. **decision_matrix**(新規性・feasibility・cheapest_kill 付き)で研究者に提示。
+8. 研究者が深掘り対象に**探索予算を配分**。
 
 **モード:** コールド生成より、まず **「seed あり de-risk・拡張」モード** を作る(信頼でき、すぐ実研究に使える)。
 

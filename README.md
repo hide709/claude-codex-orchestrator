@@ -1,6 +1,6 @@
 # orchestration — IDEA-stage funnel MVP
 
-研究の種を1件、**発散(独立) → red-team(攻撃→検証可能項目) → Tier0検証 → hard gate → arbiter(整理)**
+研究の種を1件、**発散(独立) → red-team(攻撃→検証可能項目) → revise(1回改訂) → Tier0検証 → hard gate → arbiter(整理)**
 で回し、`Research Hypothesis Contract` と `decision_matrix` を成果物として残す最小システム。
 
 設計の全体像・思想・不変条件は **[ARCHITECTURE.md](./ARCHITECTURE.md)** を参照。このMVPは §11 の左下ループ1周。
@@ -36,7 +36,9 @@ runs/<id>/
 ├── charter.json         # 固定した seed/制約/評価軸/レンズ
 ├── candidates/*.json    # 各 Research Hypothesis Contract
 ├── reviews/*.json       # red-team の攻撃(検証項目へ変換済み)
-├── verdicts/*.json      # Tier0 検証(novelty/soundness/feasibility + prior_art)
+├── revised/*.json       # red-team を受けた改訂版(原案は candidates/ に残す)
+├── evidence/*.json      # orchestrator が機械的に集めた候補文献など
+├── verdicts/*.json      # Tier0 検証(novelty/soundness/feasibility + prior_art/evidence_refs)
 ├── discarded.md         # hard gate 落ち(理由付き・消さない)
 ├── unresolved.md        # 未解決論点 + 未追跡の stronger_variant
 └── log/                 # 各LLM呼び出しの生ログ(provenance)
@@ -51,14 +53,15 @@ runs/<id>/
   `-c` 上書きが不要になる。
 - `n_lenses`: 使う発散レンズ数(=独立候補数)。
 - `concurrency`: 並列呼び出し数。
+- `lit_search_enabled`: Tier0 novelty 補助として arXiv API から候補文献を取得し、
+  `evidence/*.arxiv.json` に保存して Verifier に渡す。
 
 ## このMVPでまだやっていないこと(ARCHITECTURE §12)
 - **Spec / Patch ステージ**(重心は IDEA なので未実装)。
 - claude worker(CLI 未導入)。今は codex を複数レンズで回す=**戦略多様性**で代替。
   ベンダー多様性の追加価値(H2)は engine を足して比較する。
-- 文献検索は engine の web 能力に依存(best-effort)。検索できない時は verdict に「未検索」と残す
-  (黙って成功扱いにしない)。本格運用は INSPIRE-HEP/arXiv API 連携を別途入れる。
-- 収束ループ(複数ラウンド)は未実装(現状1ラウンド)。
+- 文献検索は arXiv API の候補取得のみ実装。INSPIRE-HEP/Semantic Scholar/ADS 連携は未実装。
+- 収束ループ(複数ラウンド)は未実装(現状 red-team 後の revise 1回のみ)。
 
 ## 既知の前提
 - codex は **ChatGPT ログイン済み**であること(`codex login status` で確認)。
