@@ -9,7 +9,9 @@
 
 ## 必要なもの
 - Python 3.9+(標準ライブラリのみ。pip 不要)
-- engine: **codex CLI**(`codex exec`)。`claude` CLI があれば config で差し替え可。
+- engine: **default は dual(Codex + Claude Code 両方)**。
+  - **Codex**: `codex exec`(必須)。
+  - **Claude Code**: **`claude -p` は使わない(別料金)**。`queue/` 経由で**常駐 Claude セッション**が処理(`claude-worker/INSTRUCTIONS.md`)。常駐 worker が居なければ自動で codex のみに degrade。
 
 ## 使い方
 
@@ -24,6 +26,10 @@ python orchestrate.py \
 
 # レンズ数(=独立候補数)を変える
 python orchestrate.py --seed "..." --n-lenses 6
+
+# engine を明示(default は dual)
+python orchestrate.py --seed "..." --engines codex          # codex のみ
+python orchestrate.py --seed "..." --engines codex,claude   # 両方(= default)
 ```
 
 出力は `runs/<timestamp>-<slug>/` に出る。まず `REPORT.md` と `decision_matrix.md` を読む。
@@ -44,8 +50,23 @@ runs/<id>/
 └── log/                 # 各LLM呼び出しの生ログ(provenance)
 ```
 
+## デュアルエンジン(Codex + Claude Code)
+案の生成(generate)を **Codex と Claude Code 両方**で行うのが default(`engine: "dual"`)。レンズに engine を振り分ける。
+
+- **Codex**: `codex exec` を直接呼ぶ。
+- **Claude Code**: **`claude -p`(別料金)は使わない**。`queue/inbox/*.json` にタスクを書き、**別途起動した常駐 Claude セッション**が処理して `queue/reports/*.json` に返す(program_creater 方式)。起動手順は `claude-worker/INSTRUCTIONS.md`。
+- **degrade / fallback**: 常駐 worker の heartbeat(`queue/claude.alive`)が無ければ claude を外して codex のみで実行。個別タスク失敗時も codex に自動フォールバック。**default が壊れない。**
+- `decision_matrix.md` の `engine` 列・`REPORT.md` の「生成 engine 内訳」で、どちらが各候補を出したか分かる。
+- redteam / revise / verify は primary(非claude)engine で実行(queue を溢れさせない)。
+
+配管だけ試す(トークン/常駐 Claude 不要):
+```bash
+python tools/mock_claude_worker.py 60        # 別ターミナルで偽 worker(heartbeat + mock 応答)
+python orchestrate.py --engines mock,claude --no-lit-search --seed "queue test"
+```
+
 ## 設定 (`config.json`)
-- `engine`: `codex` | `claude` | `mock`
+- `engine`: `dual`(default=Codex+Claude) | `codex` | `claude` | `mock`。`engines` で dual の割当。
 - `model`/`reasoning_effort`: MVP は速度優先で `gpt-5.5`/`low`。質を上げるなら `medium`+。
 - `service_tier`: `flex`。**理由**: ユーザの `~/.codex/config.toml` が `service_tier = "default"` で
   CLI(v0.121)が設定読込ごと失敗するため、`-c service_tier=flex` で**毎回上書き**して回避している
@@ -76,8 +97,8 @@ python orchestrate.py prefer  "高novelty優先 / ビームダイナミクス系
 
 ## このMVPでまだやっていないこと(ARCHITECTURE §12)
 - **Spec / Patch ステージ**(重心は IDEA なので未実装)。
-- claude worker(CLI 未導入)。今は codex を複数レンズで回す=**戦略多様性**で代替。
-  ベンダー多様性の追加価値(H2)は engine を足して比較する。
+- **デュアルエンジン(Codex+Claude)実装済み**(claude は queue 経由、`claude -p` 不使用)。
+  ベンダー多様性の追加価値(H2)は #12 のベンチで検証する。
 - 文献検索は arXiv + INSPIRE-HEP を実装。Semantic Scholar/ADS 連携は未実装。
 - 収束ループ(複数ラウンド)は未実装(現状 red-team 後の revise 1回のみ)。
 
