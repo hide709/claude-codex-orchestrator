@@ -22,6 +22,9 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -145,13 +148,27 @@ def _launch(argv, stdin_text, timeout):
 
 def _resolve_codex(cfg):
     """codex 実行ファイルを解決。Windows では PATH に無くデスクトップ版 bin に居ることがある。"""
+    cands = []
     if cfg.get("codex_path"):
-        return cfg["codex_path"]
+        cands.append(Path(cfg["codex_path"]))
+    bins = Path.home() / "AppData" / "Local" / "OpenAI" / "Codex" / "bin"
+    cands += sorted(bins.glob("*/codex.exe"), key=lambda p: p.stat().st_mtime, reverse=True)
     w = shutil.which("codex")
     if w:
-        return w
-    bins = Path.home() / "AppData" / "Local" / "OpenAI" / "Codex" / "bin"
-    cands = sorted(bins.glob("*/codex.exe"), key=lambda p: p.stat().st_mtime, reverse=True)
+        cands.append(Path(w))
+
+    seen = set()
+    for cand in cands:
+        key = str(cand).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            proc = _launch([str(cand), "--version"], None, 5)
+            if proc.returncode == 0:
+                return str(cand)
+        except Exception:
+            continue
     if cands:
         return str(cands[0])
     return "codex"
@@ -288,11 +305,35 @@ def planner(seed, constraints, cfg, run):
         "constraints": constraints,
         "eval_axes": cfg["eval_axes"],
         "lenses": cfg["lenses"][: cfg["n_lenses"]],
+        "lit_search_enabled": cfg.get("lit_search_enabled", True),
         "rounds": 1,
         "created": run["created"],
     }
     write_json(run, "charter.json", charter)
     return charter
+
+
+def _git_commit():
+    try:
+        proc = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True,
+                              text=True, timeout=5, encoding="utf-8", errors="replace")
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def provenance(run, cfg, stage, label, **extra):
+    data = {
+        "stage": stage,
+        "worker": label,
+        "engine": cfg["engine"],
+        "model": cfg["model"],
+        "run_id": run["id"],
+        "created": _now(),
+        "repo_commit": run.get("commit", ""),
+    }
+    data.update(extra)
+    return data
 
 
 def generate(runner, charter, cfg, run):
@@ -309,6 +350,7 @@ def generate(runner, charter, cfg, run):
             data = runner.run(prompt, HYPOTHESIS_SCHEMA, "hypothesis", label, run["log"])
             data["id"] = f"rq-{i:02d}"
             data["_lens"] = lens
+            data["provenance"] = provenance(run, cfg, "generate", label, lens=lens)
             return data
         except Exception as e:
             log(run, f"  [gen {lens}] FAILED: {e}")
@@ -329,7 +371,8 @@ def redteam(runner, cands, cfg, run):
     def one(c):
         label = f"review_{c['id']}"
         # blind: 著者(レンズ)情報は渡さない
-        shown = {k: v for k, v in c.items() if not k.startswith("_") and k != "id"}
+        shown = {k: v for k, v in c.items()
+                 if not k.startswith("_") and k not in ("id", "provenance")}
         prompt = render(tmpl, candidate=json.dumps(shown, ensure_ascii=False, indent=2),
                         schema=json.dumps(REVIEW_SCHEMA, ensure_ascii=False))
         try:
@@ -342,6 +385,8 @@ def redteam(runner, cands, cfg, run):
     variants = []        # stronger_variant: 未追跡として未解決へ
     for c in cands:
         rv = results.get(c["id"], {"attacks": []})
+        rv["provenance"] = provenance(run, cfg, "redteam", f"review_{c['id']}", target=c["id"])
+        c["_review"] = rv
         write_json(run, f"reviews/{c['id']}.json", rv)
         todo = []
         for a in rv.get("attacks", []):
@@ -356,6 +401,107 @@ def redteam(runner, cands, cfg, run):
     run["variants"] = variants
     log(run, f"  red-team: 攻撃を検証項目へ変換 / stronger_variant {len(variants)}件は未解決へ")
     return cands
+
+
+def revise(runner, cands, cfg, run):
+    """red-team の攻撃を受けて、自案を1回だけ改訂する。原案は candidates/ に残す。"""
+    tmpl = load_prompt("revise")
+
+    def one(c):
+        label = f"revise_{c['id']}"
+        shown = {k: v for k, v in c.items()
+                 if not k.startswith("_") and k not in ("provenance",)}
+        prompt = render(tmpl,
+                        candidate=json.dumps(shown, ensure_ascii=False, indent=2),
+                        review=json.dumps(c.get("_review", {"attacks": []}), ensure_ascii=False, indent=2),
+                        schema=json.dumps(HYPOTHESIS_SCHEMA, ensure_ascii=False))
+        try:
+            data = runner.run(prompt, HYPOTHESIS_SCHEMA, "hypothesis", label, run["log"])
+            data["id"] = c["id"]
+            data["_lens"] = c.get("_lens", "?")
+            data["_review"] = c.get("_review", {"attacks": []})
+            data["_verify_todo"] = c.get("_verify_todo", [])
+            data["provenance"] = provenance(run, cfg, "revise", label,
+                                            lens=c.get("_lens", "?"), revised_from=c["id"])
+            return data
+        except Exception as e:
+            log(run, f"  [revise {c['id']}] FAILED: {e} / 原案を継続")
+            return c
+
+    revised = _parallel(cfg, [(one, (c,)) for c in cands])
+    for c in revised:
+        write_json(run, f"revised/{c['id']}.json", c)
+    log(run, f"  revise: {len(revised)} 候補を改訂済みとして保存")
+    return revised
+
+
+def _search_terms(text, max_terms):
+    stop = {
+        "the", "and", "for", "with", "from", "that", "this", "into", "using", "use",
+        "has", "have", "are", "was", "were", "can", "could", "would", "should",
+        "study", "research", "method", "effect", "data", "analysis", "test",
+    }
+    terms = []
+    for tok in re.findall(r"[A-Za-z][A-Za-z0-9+_.-]{2,}", text):
+        t = tok.strip("._-").lower()
+        if len(t) < 3 or t in stop:
+            continue
+        if t not in terms:
+            terms.append(t)
+        if len(terms) >= max_terms:
+            break
+    return terms
+
+
+def collect_prior_art(c, cfg, run):
+    """Tier0 novelty の補助: arXiv API から候補文献を取り、artifact として残す。"""
+    if not cfg.get("lit_search_enabled", True):
+        return {"enabled": False, "query": "", "results": [], "error": ""}
+
+    text = " ".join(str(c.get(k, "")) for k in
+                    ("question", "hypothesis", "novelty_claim", "test_method"))
+    terms = _search_terms(text, int(cfg.get("lit_search_max_terms", 6)))
+    if not terms:
+        data = {"enabled": True, "query": "", "results": [], "error": "no_ascii_search_terms"}
+        write_json(run, f"evidence/{c['id']}.arxiv.json", data)
+        return data
+
+    query = " OR ".join(f"all:{t}" for t in terms)
+    params = urllib.parse.urlencode({
+        "search_query": query,
+        "start": 0,
+        "max_results": int(cfg.get("lit_search_max_results", 5)),
+        "sortBy": "relevance",
+        "sortOrder": "descending",
+    })
+    url = f"https://export.arxiv.org/api/query?{params}"
+    data = {"enabled": True, "query": query, "url": url, "results": [], "error": ""}
+    try:
+        timeout = int(cfg.get("lit_search_timeout_sec", 15))
+        req = urllib.request.Request(url, headers={"User-Agent": "claude-codex-orchestrator/0.1"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read()
+        root = ET.fromstring(body)
+        ns = {"atom": "http://www.w3.org/2005/Atom"}
+        for entry in root.findall("atom:entry", ns):
+            title = " ".join((entry.findtext("atom:title", default="", namespaces=ns) or "").split())
+            arxiv_id = (entry.findtext("atom:id", default="", namespaces=ns) or "").strip()
+            published = (entry.findtext("atom:published", default="", namespaces=ns) or "").strip()
+            authors = []
+            for author in entry.findall("atom:author", ns)[:5]:
+                name = author.findtext("atom:name", default="", namespaces=ns)
+                if name:
+                    authors.append(name)
+            data["results"].append({
+                "citation": f"{', '.join(authors)} ({published[:4]}), {title}",
+                "source_tier": "authoritative_db",
+                "relation": "arXiv search candidate; verifier must assess relation",
+                "url": arxiv_id,
+            })
+    except Exception as e:
+        data["error"] = str(e)
+    write_json(run, f"evidence/{c['id']}.arxiv.json", data)
+    return data
 
 
 def verify(runner, cands, cfg, run):
@@ -378,13 +524,18 @@ def verify(runner, cands, cfg, run):
         if miss:
             return c["id"], {"_form_fail": miss, "verdict": "kill",
                              "kill_reason": f"形不備(必須欠落): {', '.join(miss)}"}
+        prior_art_hint = collect_prior_art(c, cfg, run)
         prompt = render(tmpl,
                         candidate=json.dumps({k: v for k, v in c.items() if not k.startswith("_")},
                                              ensure_ascii=False, indent=2),
                         todo="\n".join(c.get("_verify_todo", [])) or "(なし)",
+                        prior_art_hint=json.dumps(prior_art_hint, ensure_ascii=False, indent=2),
                         schema=json.dumps(VERDICT_SCHEMA, ensure_ascii=False))
         try:
-            return c["id"], runner.run(prompt, VERDICT_SCHEMA, "verdict", label, run["log"])
+            verdict = runner.run(prompt, VERDICT_SCHEMA, "verdict", label, run["log"])
+            verdict["provenance"] = provenance(run, cfg, "verify", label, target=c["id"])
+            verdict["evidence_refs"] = [f"evidence/{c['id']}.arxiv.json"]
+            return c["id"], verdict
         except Exception as e:
             log(run, f"  [verify {c['id']}] FAILED: {e}")
             return c["id"], {"verdict": "flag", "kill_reason": "",
@@ -492,8 +643,10 @@ def report(charter, survivors, all_cands, run):
           "1. `decision_matrix.md` … 生存候補を評価軸ごとに(単一スコアに潰さず)一覧。",
           "2. `candidates/*.json` … 各 Research Hypothesis Contract。",
           "3. `reviews/*.json` … red-team の攻撃(検証項目へ変換済み)。",
-          "4. `verdicts/*.json` … Tier0 検証結果(novelty/soundness/feasibility + prior_art)。",
-          "5. `discarded.md` … hard gate 落ち(理由付き)。 `unresolved.md` … 未解決・未追跡変種。",
+          "4. `revised/*.json` … red-team 後の改訂版。原案は `candidates/` に残る。",
+          "5. `evidence/*.json` … arXiv などから機械的に収集した検証補助データ。",
+          "6. `verdicts/*.json` … Tier0 検証結果(novelty/soundness/feasibility + prior_art)。",
+          "7. `discarded.md` … hard gate 落ち(理由付き)。 `unresolved.md` … 未解決・未追跡変種。",
           "",
           "## 次の一手(人間)",
           "- 生存案のうち `cheapest_kill` が安いものから Tier1(toy計算/既存データ再解析)に回す。",
@@ -527,10 +680,10 @@ def new_run(seed, cfg):
     rid = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + _slug(seed)
     base = ROOT / "runs" / rid
     (base / "log").mkdir(parents=True, exist_ok=True)
-    for d in ("candidates", "reviews", "verdicts"):
+    for d in ("candidates", "reviews", "revised", "verdicts", "evidence"):
         (base / d).mkdir(exist_ok=True)
     return {"id": rid, "dir": base, "log": base / "log", "created": _now(),
-            "engine": cfg["engine"], "model": cfg["model"], "_logbuf": []}
+            "engine": cfg["engine"], "model": cfg["model"], "commit": _git_commit(), "_logbuf": []}
 
 
 def write_json(run, rel, obj):
@@ -556,6 +709,8 @@ DEFAULT_CFG = {
     "service_tier": "flex", "concurrency": 4, "n_lenses": 4, "timeout_sec": 420,
     "lenses": ["analogy", "anomaly", "method-driven", "contrarian", "gap", "combination"],
     "eval_axes": ["novelty", "soundness", "feasibility", "significance"],
+    "lit_search_enabled": True, "lit_search_max_terms": 6,
+    "lit_search_max_results": 5, "lit_search_timeout_sec": 15,
 }
 
 
@@ -598,20 +753,22 @@ def main():
     print(f"\n=== RUN {run['id']}  (engine={cfg['engine']}, model={cfg['model']}) ===")
     print(f"seed: {seed}\n")
 
-    log(run, "[1/6] PLANNER  — charter 固定")
+    log(run, "[1/7] PLANNER  — charter 固定")
     charter = planner(seed, args.constraints, cfg, run)
-    log(run, "[2/6] GENERATE — 発散(独立・並列)")
+    log(run, "[2/7] GENERATE — 発散(独立・並列)")
     cands = generate(runner, charter, cfg, run)
     if not cands:
         print("候補が0件。engine/認証/timeout を確認(--engine mock で配管だけ検証可)。")
         sys.exit(1)
-    log(run, "[3/6] RED-TEAM — 攻撃 -> 検証項目へ変換")
+    log(run, "[3/7] RED-TEAM — 攻撃 -> 検証項目へ変換")
     cands = redteam(runner, cands, cfg, run)
-    log(run, "[4/6] VERIFY   — Tier0(形/文献/soundness/feasibility)")
+    log(run, "[4/7] REVISE   — 攻撃を受けて仮説を1回だけ改訂")
+    cands = revise(runner, cands, cfg, run)
+    log(run, "[5/7] VERIFY   — Tier0(形/文献/soundness/feasibility)")
     cands = verify(runner, cands, cfg, run)
-    log(run, "[5/6] HARD GATE— kill を捨て案台帳へ")
+    log(run, "[6/7] HARD GATE— kill を捨て案台帳へ")
     survivors = hard_gate(cands, run)
-    log(run, "[6/6] ARBITER  — 整理(勝者は選ばない)")
+    log(run, "[7/7] ARBITER  — 整理(勝者は選ばない)")
     arbiter(survivors, run)
     write_unresolved(cands, run)
     report(charter, survivors, cands, run)
