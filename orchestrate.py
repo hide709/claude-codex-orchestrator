@@ -977,7 +977,7 @@ DEFAULT_CFG = {
     "eval_axes": ["novelty", "soundness", "feasibility", "significance"],
     "lit_search_enabled": True, "lit_search_max_terms": 6,
     "lit_search_max_results": 5, "lit_search_timeout_sec": 15, "inspire_enabled": True,
-    "queue_poll_sec": 3, "queue_timeout_sec": 600, "heartbeat_stale_sec": 120,
+    "queue_poll_sec": 3, "queue_timeout_sec": 600, "heartbeat_stale_sec": 180,
 }
 
 

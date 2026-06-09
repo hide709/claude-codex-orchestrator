@@ -6,7 +6,7 @@ orchestrator は **headless 呼び出し(codex exec / claude -p)を使わない*
 engine ごとに独立した queue を持つ:
 - `queue/<engine>/inbox/<label>.json` … orchestrator が書く依頼
 - `queue/<engine>/reports/<label>.json` … worker が書く回答(JSON のみ)
-- `queue/<engine>.alive` … heartbeat(生存信号)。**`tools/heartbeat.ps1` が背景で更新**(worker 本体は触らない)
+- `queue/<engine>.alive` … heartbeat(生存信号)。**worker のループ(`wait-for-task.ps1`)が更新** = ループが生きている証
 
 ## 起動(人間が engine ごとに)
 
@@ -25,8 +25,8 @@ cd C:\path\to\claude-codex-orchestrator
 
 ## worker のループ(セッションがやること)
 
-**heartbeat は触らない**(`start-worker.ps1` が背景ジョブ=`tools/heartbeat.ps1` で `queue/<engine>.alive` を更新し続ける。
-LLM のターン速度に依存させないため)。worker は **タスクを待って捌くこと**に専念し、止まらず以下を繰り返す:
+**heartbeat は `wait-for-task.ps1` が更新する**(ポーリングのたびに `queue/<engine>.alive` を書く)。
+つまり heartbeat の新しさ = この **worker ループが生きている証**。**ループを止めると heartbeat も止まり、orchestrator が正しく engine を外す**(別プロセスのタイマーではないので「生きてるフリ」をしない)。止まらず以下を繰り返す:
 
 1. `pwsh -NoProfile -File tools/wait-for-task.ps1 <engine>` を実行(次タスクが来るまでブロック。待機中もターンを無駄にしない)。
 2. 出力が `NO_TASK` なら 1 に戻る。ファイルパスが出たら、その JSON `{label, kind, schema, prompt}` を読む。
