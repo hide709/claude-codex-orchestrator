@@ -19,7 +19,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
@@ -138,15 +137,6 @@ def _extract_json(text):
     if s != -1 and e != -1 and e > s:
         return json.loads(text[s:e + 1])
     raise RunnerError("no JSON in model output")
-
-
-def _launch(argv, stdin_text, timeout):
-    """Windows の .cmd/.bat shim も吸収して subprocess 実行。"""
-    exe = argv[0]
-    if os.name == "nt" and exe.lower().endswith((".cmd", ".bat")):
-        argv = ["cmd", "/c", *argv]
-    return subprocess.run(argv, input=stdin_text, capture_output=True,
-                          text=True, timeout=timeout, encoding="utf-8", errors="replace")
 
 
 def worker_alive(engine, cfg):

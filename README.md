@@ -16,15 +16,13 @@
 
 ## 使い方
 
-```bash
+```powershell
 # まず配管をトークン無しで検証(推奨・最初の一回)
 python orchestrate.py --engine mock --seed "テスト用の問い"
 
-# 本番(dual = Codex + Claude)。先に別ターミナルで worker を立てる:
+# 本番(dual = Codex + Claude)。先に別タブで worker を立てる:
 #   .\tools\start-worker.ps1 codex   と   .\tools\start-worker.ps1 claude
-python orchestrate.py \
-  --seed "ミューオン g-2 の残差を説明する新しい系統誤差源は?" \
-  --constraints "J-PARC E34 の既存データ。新規ビームタイムは不可。計算は手元GPU 1枚"
+python orchestrate.py --seed "ミューオン g-2 の残差を説明する新しい系統誤差源は?" --constraints "J-PARC E34 の既存データ。新規ビームタイム不可。計算は手元GPU 1枚"
 
 # レンズ数(=独立候補数)を変える
 python orchestrate.py --seed "..." --n-lenses 6
@@ -76,7 +74,7 @@ orchestrator は engine を直接呼ばず、`queue/<engine>/inbox` に依頼を
 - 終了は各 worker タブを `Ctrl+C`。止めた engine は次回 run から自動で外れる。
 
 配管だけ試す(トークン/常駐セッション不要):
-```bash
+```powershell
 python tools/mock_worker.py claude 120       # 別ターミナルで偽 worker(heartbeat + mock 応答)
 python orchestrate.py --engines mock,claude --no-lit-search --seed "queue test"
 ```
@@ -99,7 +97,7 @@ python orchestrate.py --engines mock,claude --no-lit-search --seed "queue test"
 run をまたいで「却下した線・採用した方向・好み」を覚え、**次回の生成と検証に反映**する。
 永続するのは **人間が記録した知識だけ**(`memory/`)。`runs/` は使い捨てのまま。
 
-```bash
+```powershell
 python orchestrate.py promote <run_id> <cand_id> --note "追求する理由"
 python orchestrate.py reject  <run_id> <cand_id> --note "死んだ線の理由"
 python orchestrate.py prefer  "高novelty優先 / ビームダイナミクス系統に注力"
