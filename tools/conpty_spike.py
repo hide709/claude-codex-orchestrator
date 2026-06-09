@@ -83,7 +83,8 @@ def _launch_argv(engine, exe, job):
     if engine == "codex":
         return [exe, "-c", "service_tier=flex", "-s", "workspace-write", "-a", "never", job]
     if engine == "claude":
-        return [exe, "--permission-mode", "acceptEdits", job]
+        # 本番(orchestrate.py)と揃える。BypassPermissions 承認は初回一度きり(承認済み前提)。
+        return [exe, "--dangerously-skip-permissions", job]
     raise ValueError(f"unknown engine {engine}")
 
 

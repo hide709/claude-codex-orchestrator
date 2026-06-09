@@ -64,5 +64,32 @@ RESULT[claude]: step1(seed job)=PASS   step2(inject 2nd job)=PASS
 - 新規依存 **pywinpty(Windows 専用)**。`requirements.txt` に追加。
 - **TUI 駆動は version 依存で脆い面がある**(submit キーの扱い等)。CLI/TUI の更新で壊れうる保守リスク。
   → 完了判定は report ファイルに寄せ、TUI ストリーム解析は最小化。submit は別キー送出に固定。
-- 現状コードはまだ self-loop/常駐 worker モデル。**本決定の実装は follow-up**:
-  `InteractiveSessionRunner`(pywinpty)を `make_runner_for(codex/claude)` に差し替え、旧 worker 機構を撤去する。
+- ~~現状コードはまだ self-loop/常駐 worker モデル。本決定の実装は follow-up~~ → **実装済み**(下記)。
+
+## 実装メモ(2026-06-09 追記)
+
+`InteractiveSessionRunner`(pywinpty)を `orchestrate.py` に実装し、`make_runner_for(codex/claude)` で差し替え。
+1セッションを使い回し(warmup は1回)、各ステージは directive を注入。完了は report ファイルで判定。
+
+### エンジン別 起動フラグ(実機で確定)
+- **codex**: `-c service_tier=flex -c model_reasoning_effort=low --dangerously-bypass-approvals-and-sandbox`
+  - ネストした pseudo-console 内では codex の windows-sandbox が PowerShell/node_repl を spawn できず
+    **`windows sandbox: spawn setup refresh` で失敗**する。bypass で回避(orchestrator は信頼コード、
+    worker は queue/ 内の read/write のみ=write-execute プレーン内)。
+- **claude**: `--dangerously-skip-permissions`
+  - **BypassPermissions の承認は初回一度きり**(`~/.claude.json` に記録)。一度手動で「Yes, I accept」すれば
+    以降は driven セッションでもプロンプトが出ない。
+  - `--permission-mode acceptEdits` は Write は無確認だが **rename 等のシェルコマンドが承認待ちで停止**するため不可。
+- **directive は `.tmp→rename`(atomic)**。orchestrator の途中読みを原理的に防ぐ。上記フラグで両エンジンとも
+  rename が無確認に通る。run() 側にも parse 失敗時の再読込ガードを保持。
+
+### 検証
+- spike(`tools/conpty_spike.py claude`)を **skip-permissions** で再実行 → step1/step2 とも PASS(承認プロンプト無しを確認)。
+- フル pipeline: codex は `--engine codex` で実ビーム力学仮説を生成して完走。claude は `--engine claude` で end-to-end 確認。
+- **テスト注記**: codex/claude は自前の tool 子プロセスを spawn するため、検証は PowerShell ツールの
+  `dangerouslyDisableSandbox` 下で実行した(ネスト sandbox が二重になるのを避けるため)。
+
+### 撤去
+- 旧モデルのファイルを撤去: `tools/start-worker.ps1` / `tools/wait-for-task.ps1` / `tools/mock_worker.py` /
+  `worker/INSTRUCTIONS.md`。heartbeat / `.alive` も廃止。`MockRunner` は `orchestrate.py` 内に in-process 実装。
+- `python orchestrate.py` だけで spawn〜駆動〜完了まで完全自動(手動 worker タブ不要)。

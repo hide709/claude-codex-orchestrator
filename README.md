@@ -8,11 +8,11 @@
 > 原則: **AIは候補を出すだけ。裁くのは客観検証。決めるのは人間。** orchestrator(`orchestrate.py`)はLLMではない。
 
 ## 必要なもの
-- Python 3.9+(標準ライブラリのみ。pip 不要)
-- engine: **default は dual(Codex + Claude Code 両方)**。両方とも **headless は使わない**
-  (`codex exec` / `claude -p` を呼ばない)。各 engine は **常駐セッション + ファイル queue** で動く:
-  別ターミナルで `codex` / `claude` を対話起動し `queue/<engine>/` を処理させる(`worker/INSTRUCTIONS.md`)。
-  worker が居ない engine は自動で除外。実機を回すには **最低1つ worker が必要**(配管確認は `--engine mock`)。
+- Python 3.9+ と **pywinpty**(`pip install -r requirements.txt`。Windows 専用)。
+- engine: **default は dual(Codex + Claude Code 両方)**。両方とも **headless を使わない**
+  (`codex exec` / `claude -p` を呼ばない = サブスク内・**追加課金なし**)。orchestrator が **pywinpty(ConPTY)で
+  対話セッションを自動 spawn・駆動**する(ADR-001)。**手動で worker を立てる必要はない。**
+  実行ファイルを解決できない engine は自動で除外(配管確認は `--engine mock`、pywinpty 不要)。
 
 ## 使い方
 
@@ -20,8 +20,7 @@
 # まず配管をトークン無しで検証(推奨・最初の一回)
 python orchestrate.py --engine mock --seed "テスト用の問い"
 
-# 本番(dual = Codex + Claude)。先に別ターミナルで worker を立てる:
-#   .\tools\start-worker.ps1 codex   と   .\tools\start-worker.ps1 claude
+# 本番(dual = Codex + Claude)。orchestrator が両セッションを pywinpty で自動起動・駆動する
 python orchestrate.py \
   --seed "ミューオン g-2 の残差を説明する新しい系統誤差源は?" \
   --constraints "J-PARC E34 の既存データ。新規ビームタイムは不可。計算は手元GPU 1枚"
@@ -29,9 +28,9 @@ python orchestrate.py \
 # レンズ数(=独立候補数)を変える
 python orchestrate.py --seed "..." --n-lenses 6
 
-# engine を明示(default は dual)。指定した engine の worker が必要
-python orchestrate.py --seed "..." --engines codex          # codex worker のみ
-python orchestrate.py --seed "..." --engines codex,claude   # 両方(= default)
+# engine を明示(default は dual)
+python orchestrate.py --seed "..." --engine codex           # codex のみ
+python orchestrate.py --seed "..." --engine claude          # claude のみ
 ```
 
 出力は `runs/<timestamp>-<slug>/` に出る。まず `REPORT.md` と `decision_matrix.md` を読む。
@@ -53,40 +52,35 @@ runs/<id>/
 ```
 
 ## デュアルエンジン(Codex + Claude Code)— 完全統一
-**codex も claude も headless(codex exec / claude -p)を使わず、両方とも「常駐セッション + ファイル queue」に統一。**
-orchestrator は engine を直接呼ばず、`queue/<engine>/inbox` に依頼を書いて `queue/<engine>/reports` を待つだけ(program_creater / Shogun 方式)。
+**codex も claude も headless(codex exec / claude -p)を使わず、両方とも対話セッションに統一**(サブスク内・追加課金なし)。
+orchestrator が **pywinpty(ConPTY)で対話セッションを spawn し、job 単位で directive を注入 → `queue/<engine>/reports/<label>.json` で完了検知**(ADR-001)。
+LLM に常駐ループは持たせない(**supervisor がループを所有**)。1セッションを使い回す(warmup は1回、各ステージは注入)。
 
-- **全ステージが queue 経由**: generate はレンズに engine を振り分け、redteam / revise / verify は primary(先頭の生存 engine)が処理。
-- **worker**: 別途 `codex` / `claude` を対話起動し queue を処理(`worker/INSTRUCTIONS.md`、起動は `tools/start-worker.ps1 <engine>`)。
-- **生存判定 / degrade**: `queue/<engine>.alive` の heartbeat が古い engine は自動で除外。生存 engine が無ければ「worker を立てて」と表示して終了(`--engine mock` は worker 不要)。タスク失敗時は別の生存 engine にフォールバック。
+- **全ステージが同一セッション経由**: generate はレンズに engine を振り分け、redteam / revise / verify は primary(先頭の生存 engine)が処理。
+- **起動フラグ(自動付与)**: codex=`--dangerously-bypass-approvals-and-sandbox`(ネスト環境の sandbox spawn 失敗を回避)、claude=`--dangerously-skip-permissions`。どちらも write-execute は repo 内に限定(§8)。
+- **生存判定 / degrade**: 実行ファイルを解決できない engine は自動で除外。生存 engine が無ければ終了(`--engine mock` は pywinpty 不要)。タスク失敗時は別の生存 engine にフォールバック。
 - **可視化**: `decision_matrix.md` の `engine` 列・`REPORT.md` の「生成 engine 内訳」で、どちらが各候補を出したか分かる。
 
-### Windows での実際の動かし方(端末を分ける)
-1. **新しい PowerShell** を engine 数+1 だけ開く(Windows Terminal のタブでよい)。各タブで
-   `cd C:\path\to\claude-codex-orchestrator`(dual のコードがあるブランチに居ること)。
-2. **worker を立てる**(engine ごとに1タブ):
-   ```powershell
-   .\tools\start-worker.ps1 codex
-   .\tools\start-worker.ps1 claude
-   ```
-   各 `<engine> queue を見張っています` と出れば準備完了(対話セッション。headless 不使用)。
-3. **オーケストレータ**(別タブ): `python orchestrate.py --seed "あなたの問い"`
-   → `生成: N候補 (codex:.., claude:..)` で両エンジン稼働。
-- worker を立てたら **すぐ**(既定120秒以内)オーケストレータを回す(heartbeat の鮮度で生存判定)。
-- 終了は各 worker タブを `Ctrl+C`。止めた engine は次回 run から自動で外れる。
+### Windows での実際の動かし方
+```powershell
+pip install -r requirements.txt             # 初回のみ(pywinpty)
+python orchestrate.py --seed "あなたの問い"     # これだけ。両セッションは自動で起動・駆動される
+```
+→ `生成: N候補 (codex:.., claude:..)` で両エンジン稼働。**別タブで worker を立てる必要はない。**
 
-配管だけ試す(トークン/常駐セッション不要):
+前提(初回のみ):codex / claude が**ログイン済み**で、claude は一度だけ手動で `--dangerously-skip-permissions` の
+「Yes, I accept」を承認しておく(`~/.claude.json` に記録され、以降 driven セッションでプロンプトは出ない)。
+
+配管だけ試す(pywinpty / トークン不要):
 ```bash
-python tools/mock_worker.py claude 120       # 別ターミナルで偽 worker(heartbeat + mock 応答)
-python orchestrate.py --engines mock,claude --no-lit-search --seed "queue test"
+python orchestrate.py --engine mock --no-lit-search --seed "queue test"
 ```
 
 ## 設定 (`config.json`)
 - `engine`: `dual`(default=Codex+Claude) | `codex` | `claude` | `mock`。`engines` で dual の割当。
-- `model`/`reasoning_effort`/`service_tier`: orchestrator は engine を直接呼ばないため**未使用**
-  (model 等は各常駐セッション側で選ぶ)。`service_tier=flex` は codex worker 起動スクリプトが
-  `~/.codex/config.toml` の不正な `service_tier="default"` を回避するために使う。
-- `queue_poll_sec`/`queue_timeout_sec`/`heartbeat_stale_sec`: queue ポーリング間隔 / 応答待ち上限 / worker を生存とみなす鮮度(秒)。
+- `reasoning_effort`/`service_tier`: **codex の対話起動フラグに渡す**(`-c service_tier=flex -c model_reasoning_effort=low`)。`model` は各セッション側で選ぶため未使用。
+- `queue_poll_sec`/`queue_timeout_sec`: report ポーリング間隔 / 1 job の応答待ち上限(秒。`--timeout` で上書き)。
+- `session_warmup_sec`/`inject_enter_delay_sec`: セッション起動待ち / 注入時に Enter を別送するまでの遅延(秒)。
 - `n_lenses`: 使う発散レンズ数(=独立候補数)。
 - `concurrency`: 並列呼び出し数。
 - `lit_search_enabled` / `inspire_enabled`: Tier0 novelty 補助として arXiv(preprint)と
@@ -112,12 +106,13 @@ python orchestrate.py prefer  "高novelty優先 / ビームダイナミクス系
 
 ## このMVPでまだやっていないこと(ARCHITECTURE §12)
 - **Spec / Patch ステージ**(重心は IDEA なので未実装)。
-- **デュアルエンジン(Codex+Claude)実装済み・完全統一**(両方とも headless 不使用、常駐+queue)。
+- **デュアルエンジン(Codex+Claude)実装済み・完全統一**(両方とも headless 不使用、pywinpty 駆動の対話セッション)。
   ベンダー多様性の追加価値(H2)は #12 のベンチで検証する。
 - 文献検索は arXiv + INSPIRE-HEP を実装。Semantic Scholar/ADS 連携は未実装。
 - 収束ループ(複数ラウンド)は未実装(現状 red-team 後の revise 1回のみ)。
 
 ## 既知の前提
-- codex / claude が **ログイン済み**で、新しいターミナルの PATH から対話起動できること。
-- 実機 run には **対象 engine の常駐 worker が必要**(無ければその engine は自動で外れ、生存ゼロなら終了)。
-- worker は `queue/<engine>/` 内のみ読み書きする(ARCHITECTURE §8 の Write/Execute プレーンに従う)。
+- **pywinpty** が入っていること(`pip install -r requirements.txt`、Windows 専用)。
+- codex / claude が **ログイン済み**で PATH から起動できること(claude は初回のみ BypassPermissions を手動承認)。
+- driven セッションは `queue/<engine>/` 内のみ読み書きする想定(ARCHITECTURE §8 の Write/Execute プレーン)。
+- 実行ファイルを解決できない engine は自動で外れ、生存ゼロなら終了(`--engine mock` は pywinpty 不要)。

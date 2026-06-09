@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -149,21 +150,49 @@ def _launch(argv, stdin_text, timeout):
                           text=True, timeout=timeout, encoding="utf-8", errors="replace")
 
 
-def worker_alive(engine, cfg):
-    """常駐 worker の heartbeat(queue/<engine>.alive)が新しいか。"""
-    hb = QUEUE_DIR / f"{engine}.alive"
-    if not hb.exists():
-        return False
-    try:
-        return (time.time() - hb.stat().st_mtime) < cfg.get("heartbeat_stale_sec", 120)
-    except Exception:
-        return False
+def _resolve_engine_exe(engine, cfg):
+    """engine の実行ファイルを解決(config 上書き → PATH → 既定の場所)。見つからなければ None。"""
+    p = cfg.get(f"{engine}_path")
+    if p and Path(p).exists():
+        return p
+    w = shutil.which(engine)
+    if w:
+        return w
+    cands = []
+    if engine == "codex":
+        cands = sorted((Path.home() / "AppData" / "Local" / "OpenAI" / "Codex" / "bin").glob("*/codex.exe"),
+                       key=lambda x: x.stat().st_mtime, reverse=True)
+    elif engine == "claude":
+        cands = [Path.home() / "AppData" / "Roaming" / "SPB_Data" / ".local" / "bin" / "claude.exe",
+                 Path.home() / ".local" / "bin" / "claude.exe"]
+    for c in cands:
+        if Path(c).exists():
+            return str(c)
+    return None
 
 
-class QueueRunner:
-    """**headless 呼び出し(codex exec / claude -p)はしない。** program_creater / Shogun 方式:
-    engine ごとに別途起動した**常駐セッション**へ、ファイル queue 経由でタスクを渡し報告を待つ。
-    codex も claude も同じ仕組みに統一(起動は tools/start-worker.ps1 <engine>)。"""
+def engine_available(engine, cfg):
+    return engine == "mock" or _resolve_engine_exe(engine, cfg) is not None
+
+
+def _engine_argv(engine, exe, seed, cfg):
+    """対話(非 headless)起動の argv。低フリクション(無確認・workspace書込)で seed prompt を渡す。"""
+    if engine == "codex":
+        # ネスト環境で codex の windows sandbox spawn が失敗するため、サンドボックスを bypass
+        # (worker は queue/ 内の read/write のみ。orchestrator は信頼コード)
+        return [exe, "-c", "service_tier=flex", "-c", f"model_reasoning_effort={cfg.get('reasoning_effort', 'low')}",
+                "--dangerously-bypass-approvals-and-sandbox", seed]
+    if engine == "claude":
+        # skip-permissions: BypassPermissions 承認は初回一度きり(~/.claude.json に記録)。
+        # 承認済みなら以降プロンプト無し。rename 等シェルも write-execute プレーン内は無確認。
+        return [exe, "--dangerously-skip-permissions", seed]
+    raise ValueError(f"unknown engine {engine}")
+
+
+class InteractiveSessionRunner:
+    """ADR-001: orchestrator が対話セッション(codex/claude)を **pywinpty(ConPTY)** で spawn・駆動する。
+    headless(codex exec / claude -p)を使わない = サブスク内・**追加課金なし**。supervisor が job 単位で
+    inject/observe し、完了は **report ファイル**で判定。LLM に daemon ループは持たせない。"""
     def __init__(self, engine, cfg):
         self.engine = engine
         self.cfg = cfg
@@ -171,45 +200,101 @@ class QueueRunner:
         self.qout = QUEUE_DIR / engine / "reports"
         self.qin.mkdir(parents=True, exist_ok=True)
         self.qout.mkdir(parents=True, exist_ok=True)
+        self.exe = _resolve_engine_exe(engine, cfg)
         self.poll = cfg.get("queue_poll_sec", 3)
         self.timeout = cfg.get("queue_timeout_sec", cfg.get("timeout_sec", 600))
+        self.warmup = cfg.get("session_warmup_sec", 8)
+        self.enter_delay = cfg.get("inject_enter_delay_sec", 1.5)
+        self.proc = None
+        self._buf = []
+        self._blk = threading.Lock()
+        self._lock = threading.Lock()   # 1セッション=直列。job 注入が交錯しないように
+
+    def _directive(self, label):
+        # .tmp に書いてから rename(atomic)。orchestrator の途中読みを原理的に防ぐ。
+        # rename はシェルだが claude=skip-permissions / codex=bypass で無確認に通る。
+        return (f"queue/{self.engine}/inbox/{label}.json を読み、その prompt に従い schema に厳密準拠した "
+                f"JSON だけを、まず queue/{self.engine}/reports/{label}.json.tmp に書いてから "
+                f"queue/{self.engine}/reports/{label}.json へ rename してください。説明やコードフェンスは書かない。")
+
+    def _spawn(self, seed):
+        from winpty import PtyProcess  # 遅延 import(mock/offline は pywinpty 不要)
+        if self.exe is None:
+            raise RunnerError(f"{self.engine} の実行ファイルが見つからない(PATH/既定の場所に無い)")
+        self.proc = PtyProcess.spawn(_engine_argv(self.engine, self.exe, seed, self.cfg),
+                                     cwd=str(ROOT), dimensions=(50, 160))
+
+        def _readloop():
+            while True:
+                try:
+                    d = self.proc.read(4096)
+                except Exception:
+                    break
+                if d:
+                    with self._blk:
+                        self._buf.append(d)
+                else:
+                    time.sleep(0.05)
+        threading.Thread(target=_readloop, daemon=True).start()
+        time.sleep(self.warmup)   # 起動待ち
 
     def run(self, prompt, schema, kind, label, logdir):
-        if not worker_alive(self.engine, self.cfg):
-            raise RunnerError(f"{self.engine} worker heartbeat が無い/古い: "
-                              f"tools/start-worker.ps1 {self.engine} で常駐 worker を起動してください")
-        inbox_f = self.qin / f"{label}.json"
-        report_f = self.qout / f"{label}.json"
-        tmp_f = self.qin / f".{label}.{os.getpid()}.tmp"
-        if report_f.exists():
-            report_f.unlink()
-        payload = json.dumps(
-            {"label": label, "kind": kind, "schema": schema, "prompt": prompt, "created": _now()},
-            ensure_ascii=False, indent=2)
-        tmp_f.write_text(payload, encoding="utf-8")
-        tmp_f.replace(inbox_f)
-        waited = 0
-        while waited < self.timeout:
+        with self._lock:
+            inbox_f = self.qin / f"{label}.json"
+            report_f = self.qout / f"{label}.json"
+            tmp_f = self.qin / f".{label}.tmp"
             if report_f.exists():
-                raw = report_f.read_text(encoding="utf-8", errors="replace")
-                (logdir / f"{label}.log.txt").write_text(
-                    f"[{self.engine}-queue] {label}\n--- report ---\n{raw}", encoding="utf-8")
-                try:
-                    return _extract_json(raw)
-                finally:
-                    for p in (inbox_f, report_f):
-                        try:
-                            p.unlink()
-                        except FileNotFoundError:
-                            pass
-            time.sleep(self.poll)
-            waited += self.poll
+                report_f.unlink()
+            tmp_f.write_text(json.dumps(
+                {"label": label, "kind": kind, "schema": schema, "prompt": prompt, "created": _now()},
+                ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp_f.replace(inbox_f)
+            directive = self._directive(label)
+            if self.proc is None:
+                self._spawn(directive)                  # 最初の job は seed prompt として起動時に渡す
+            else:
+                self.proc.write(directive)              # 注入: テキストと Enter を別 write に分ける(ADR-001)
+                time.sleep(self.enter_delay)
+                self.proc.write("\r")
+            waited = 0
+            while waited < self.timeout:
+                if report_f.exists():
+                    raw = report_f.read_text(encoding="utf-8", errors="replace")
+                    try:
+                        data = _extract_json(raw)
+                    except Exception:
+                        time.sleep(self.poll)      # 途中書き込みの可能性 → 次ポーリングで再読込
+                        waited += self.poll
+                        continue
+                    (logdir / f"{label}.log.txt").write_text(
+                        f"[{self.engine}-session] {label}\n--- report ---\n{raw}", encoding="utf-8")
+                    return data
+                if self.proc is not None and not self.proc.isalive():
+                    self._dump(logdir, label, "session が終了(report 未生成)")
+                    raise RunnerError(f"{self.engine} session が終了(report 未生成) label={label}")
+                time.sleep(self.poll)
+                waited += self.poll
+            self._dump(logdir, label, f"timeout {self.timeout}s")
+            raise RunnerError(f"{self.engine} session timeout ({self.timeout}s) label={label}")
+
+    def _dump(self, logdir, label, note):
+        """診断用: セッション(TUI)出力をログに吐く。"""
+        with self._blk:
+            out = "".join(self._buf)
         try:
-            inbox_f.unlink()
-        except FileNotFoundError:
+            (logdir / f"{label}.session.txt").write_text(
+                f"[{self.engine}] {note}\n--- session output (last 6000) ---\n" + out[-6000:],
+                encoding="utf-8")
+        except Exception:
             pass
-        raise RunnerError(f"{self.engine} queue timeout ({self.timeout}s): "
-                          f"常駐 {self.engine} worker が稼働しているか確認(tools/start-worker.ps1 {self.engine})")
+
+    def shutdown(self):
+        if self.proc is not None:
+            try:
+                self.proc.terminate(force=True)
+            except Exception:
+                pass
+            self.proc = None
 
 
 class MockRunner:
@@ -259,15 +344,35 @@ class MockRunner:
         raise RunnerError(f"unknown kind {kind}")
 
 
+_RUNNERS = {}
+_RUNNERS_LOCK = threading.Lock()
+
+
 def make_runner_for(engine, cfg):
-    if engine == "mock":
-        return MockRunner(cfg)
-    return QueueRunner(engine, cfg)   # codex / claude を常駐+queue に統一(headless 廃止)
+    """engine→Runner。対話セッションは1 run 内で再利用するため engine 単位でキャッシュ(thread-safe)。"""
+    with _RUNNERS_LOCK:   # 並列 generate で同一 engine の二重 spawn を防ぐ
+        r = _RUNNERS.get(engine)
+        if r is None:
+            r = MockRunner(cfg) if engine == "mock" else InteractiveSessionRunner(engine, cfg)
+            _RUNNERS[engine] = r
+        return r
+
+
+def shutdown_runners():
+    """run 終了時に spawn 済みセッションを終了する。"""
+    for r in _RUNNERS.values():
+        fn = getattr(r, "shutdown", None)
+        if fn:
+            try:
+                fn()
+            except Exception:
+                pass
+    _RUNNERS.clear()
 
 
 def usable_engines(engines, cfg):
-    """使える engine を順序保持で返す。mock は常に可、それ以外は常駐 worker が生存している場合のみ。"""
-    return [e for e in engines if e == "mock" or worker_alive(e, cfg)]
+    """使える engine を順序保持で返す。mock は常に可、それ以外は実行ファイルが解決できる場合のみ。"""
+    return [e for e in engines if engine_available(e, cfg)]
 
 
 # ----------------------------------------------------------------------------
@@ -987,7 +1092,8 @@ DEFAULT_CFG = {
     "eval_axes": ["novelty", "soundness", "feasibility", "significance"],
     "lit_search_enabled": True, "lit_search_max_terms": 6,
     "lit_search_max_results": 5, "lit_search_timeout_sec": 15, "inspire_enabled": True,
-    "queue_poll_sec": 3, "queue_timeout_sec": 600, "heartbeat_stale_sec": 120,
+    "queue_poll_sec": 3, "queue_timeout_sec": 600,
+    "session_warmup_sec": 8, "inject_enter_delay_sec": 1.5,
 }
 
 
@@ -1019,6 +1125,7 @@ def main():
     ap.add_argument("--no-lit-search", action="store_true",
                     help="文献検索(arXiv/INSPIRE)を無効化(offline/高速テスト用)")
     ap.add_argument("--engines", help='生成 engine をカンマ区切りで上書き(例: "codex,claude" / "codex")')
+    ap.add_argument("--timeout", type=int, help="queue_timeout_sec(1 job の応答待ち上限・秒)を上書き")
     args = ap.parse_args()
 
     seed = args.seed or (Path(args.seed_file).read_text(encoding="utf-8").strip()
@@ -1037,6 +1144,8 @@ def main():
         es = [e.strip() for e in args.engines.split(",") if e.strip()]
         cfg["engines"] = es
         cfg["engine"] = "dual" if len(es) > 1 else (es[0] if es else cfg["engine"])
+    if args.timeout:
+        cfg["queue_timeout_sec"] = args.timeout
 
     run = new_run(seed, cfg)
     mem = load_memory()
@@ -1047,40 +1156,43 @@ def main():
 
     log(run, "[1/7] PLANNER  — charter 固定")
     charter = planner(seed, args.constraints, cfg, run)
-    # 使える engine(常駐 worker が生きているもの。mock は常に可)を確定
+    # 使える engine(実行ファイルが解決できるもの。mock は常に可)を確定。
+    # セッションは orchestrator が pywinpty で spawn・駆動する(手動 worker 不要)。
     live = usable_engines(charter["engines"], cfg)
     if not live:
-        print(f"使える engine がありません(要求: {charter['engines']})。codex/claude は headless を廃止したので常駐 worker が必要。")
-        print("  worker を立てる(別 PowerShell): .\\tools\\start-worker.ps1 codex  /  .\\tools\\start-worker.ps1 claude")
+        print(f"使える engine がありません(要求: {charter['engines']})。")
+        print("  codex / claude が PATH か既定の場所にあるか確認(新しいターミナルの PATH に入っているか)。")
         print("  配管だけ確認するなら: --engine mock")
         sys.exit(1)
     if live != list(charter["engines"]):
-        log(run, f"  注意: worker 未稼働を除外 → 使用 engine {live}(要求 {charter['engines']})")
+        log(run, f"  注意: 実行ファイル未解決の engine を除外 → 使用 engine {live}(要求 {charter['engines']})")
     charter["engines"] = live
-    runner = make_runner_for(live[0], cfg)   # primary(redteam/revise/verify 用)
+    runner = make_runner_for(live[0], cfg)   # primary。セッションは初回 job で spawn される
 
-    log(run, "[2/7] GENERATE — 発散(独立・並列・memory反映)")
-    cands = generate(runner, charter, cfg, run, mem)
-    if not cands:
-        print("候補が0件。engine/認証/timeout を確認(--engine mock で配管だけ検証可)。")
-        sys.exit(1)
-    log(run, "[3/7] RED-TEAM — 攻撃 -> 検証項目へ変換")
-    cands = redteam(runner, cands, cfg, run)
-    log(run, "[4/7] REVISE   — 攻撃を受けて仮説を1回だけ改訂")
-    cands = revise(runner, cands, cfg, run)
-    log(run, "[5/7] VERIFY   — Tier0(形/文献/soundness/feasibility)")
-    cands = verify(runner, cands, cfg, run, mem)
-    log(run, "[6/7] HARD GATE— kill を捨て案台帳へ")
-    survivors = hard_gate(cands, run)
-    log(run, "[7/7] ARBITER  — 整理(勝者は選ばない)")
-    arbiter(survivors, run)
-    write_unresolved(cands, run)
-    report(charter, survivors, cands, run)
-    append_seen(run, cands)                     # 自動メモリ(重複検知用)に追記
-
-    write_text(run, "run.log", "\n".join(run["_logbuf"]))
-    print(f"\n✅ 完了 → {run['dir']}")
-    print(f"   まず読む: {run['dir'] / 'REPORT.md'}  /  {run['dir'] / 'decision_matrix.md'}")
+    try:
+        log(run, "[2/7] GENERATE — 発散(独立・並列・memory反映)")
+        cands = generate(runner, charter, cfg, run, mem)
+        if not cands:
+            print("候補が0件。engine/認証/timeout を確認(--engine mock で配管だけ検証可)。")
+            sys.exit(1)
+        log(run, "[3/7] RED-TEAM — 攻撃 -> 検証項目へ変換")
+        cands = redteam(runner, cands, cfg, run)
+        log(run, "[4/7] REVISE   — 攻撃を受けて仮説を1回だけ改訂")
+        cands = revise(runner, cands, cfg, run)
+        log(run, "[5/7] VERIFY   — Tier0(形/文献/soundness/feasibility)")
+        cands = verify(runner, cands, cfg, run, mem)
+        log(run, "[6/7] HARD GATE— kill を捨て案台帳へ")
+        survivors = hard_gate(cands, run)
+        log(run, "[7/7] ARBITER  — 整理(勝者は選ばない)")
+        arbiter(survivors, run)
+        write_unresolved(cands, run)
+        report(charter, survivors, cands, run)
+        append_seen(run, cands)                     # 自動メモリ(重複検知用)に追記
+        write_text(run, "run.log", "\n".join(run["_logbuf"]))
+        print(f"\n✅ 完了 → {run['dir']}")
+        print(f"   まず読む: {run['dir'] / 'REPORT.md'}  /  {run['dir'] / 'decision_matrix.md'}")
+    finally:
+        shutdown_runners()                          # spawn した対話セッションを終了
 
 
 if __name__ == "__main__":

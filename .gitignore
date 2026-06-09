@@ -17,3 +17,6 @@ __pycache__/
 Thumbs.db
 .vscode/
 .idea/
+
+# Claude Code のローカルセッション状態(共有しない)
+.claude/
