@@ -49,8 +49,10 @@ LENS_DESC = {
 }
 
 # ----------------------------------------------------------------------------
-# スキーマ (codex --output-schema 用 / strict structured output 互換)
-#   * すべての property を required にし、N/A は空文字/空配列で返させる
+# スキーマ (strict structured output 互換)
+#   * 原則すべての property を required にし、N/A は空文字/空配列で返させる。
+#   * 例外: baseline / success_metric / failure_condition は任意(Issue #40 P3)。
+#     形ゲート(required ベース)の対象外 = 後方互換。domain config 側で記入を促す。
 # ----------------------------------------------------------------------------
 def _obj(props, required):
     return {"type": "object", "additionalProperties": False,
@@ -72,6 +74,12 @@ HYPOTHESIS_SCHEMA = _obj(
         "cheapest_kill":       {"type": "string"},
         "assumptions":         {"type": "array", "items": {"type": "string"}},
         "unknowns":            {"type": "array", "items": {"type": "string"}},
+        # ---- 任意(比較・検証の明確化。研究種なら分野を問わず有効) ----
+        "baseline":            {"type": "string"},
+        "success_metric":      {"type": "string"},
+        "failure_condition":   {"type": "string"},
+        # 文献検索用の英語キーワード(契約本文が日本語でも evidence 検索を効かせる)
+        "search_keywords":     {"type": "array", "items": {"type": "string"}},
     },
     ["id", "question", "hypothesis", "novelty_claim", "soundness", "falsification",
      "test_method", "feasibility", "significance_if_true", "risk_type",
@@ -98,12 +106,22 @@ _AXIS = _obj({"assessment": {"type": "string"},
               "confidence": {"type": "string", "enum": ["low", "medium", "high"]}},
              ["assessment", "confidence"])
 
-VERDICT_SCHEMA = _obj(
-    {
-        "novelty":      _AXIS,
-        "soundness":    _AXIS,
-        "feasibility":  _AXIS,
-        "significance": _AXIS,
+DEFAULT_EVAL_AXES = ["novelty", "soundness", "feasibility", "significance"]
+
+# 評価軸の説明(verifier プロンプトの追加軸用)。config の eval_axes_desc で上書き/追加できる。
+AXIS_DESC = {
+    "novelty": "新規性", "soundness": "整合性", "feasibility": "実現性", "significance": "重要性",
+    "mechanism_clarity":  "物理・工学メカニズムが明確に述べられているか",
+    "validation_clarity": "最初の検証(toy model/シミュレーション/データ)と成功・失敗条件が明確か",
+    "baseline_clarity":   "比較すべき baseline が明確に定義されているか",
+}
+
+
+def verdict_schema(axes):
+    """eval_axes(config 駆動)から verdict スキーマを生成。各軸は assessment+confidence。
+    HEP は既定4軸、spacecraft 等は config で軸を足せる(soft score を単一値に潰さない原則は不変)。"""
+    props = {ax: _AXIS for ax in axes}
+    props.update({
         "prior_art": {"type": "array", "items": _obj(
             {"citation":    {"type": "string"},
              "source_tier": {"type": "string",
@@ -113,10 +131,18 @@ VERDICT_SCHEMA = _obj(
         "verdict":     {"type": "string", "enum": ["keep", "flag", "kill"]},
         "kill_reason": {"type": "string"},
         "notes":       {"type": "string"},
-    },
-    ["novelty", "soundness", "feasibility", "significance",
-     "prior_art", "verdict", "kill_reason", "notes"],
-)
+    })
+    return _obj(props, list(axes) + ["prior_art", "verdict", "kill_reason", "notes"])
+
+
+def extra_axes_text(axes, cfg):
+    """core 4軸を超えるドメイン軸の説明を verifier プロンプトに渡す文。"""
+    descs = {**AXIS_DESC, **cfg.get("eval_axes_desc", {})}
+    extra = [a for a in axes if a not in DEFAULT_EVAL_AXES]
+    return "\n".join(f"- **{a}** — {descs.get(a, a)}" for a in extra) if extra else "(なし)"
+
+
+VERDICT_SCHEMA = verdict_schema(DEFAULT_EVAL_AXES)   # 既定(HEP)。verify は cfg["eval_axes"] で都度生成
 
 # ----------------------------------------------------------------------------
 # Runner 抽象 (engine を差し替え可能に)
@@ -331,16 +357,18 @@ class MockRunner:
             ]}
         if kind == "verdict":
             v = "kill" if idx == 1 else ("flag" if idx % 2 == 0 else "keep")  # 1件は kill で gate を検証
-            return {
-                "novelty":      {"assessment": "中程度（mock）", "confidence": "low"},
-                "soundness":    {"assessment": "問題なし（mock）", "confidence": "medium"},
-                "feasibility":  {"assessment": "実現可能（mock）", "confidence": "low"},
-                "significance": {"assessment": "中（mock）", "confidence": "low"},
+            # 軸は渡された schema から導出(eval_axes が config 駆動になったため / Issue #40)
+            out = {ax: {"assessment": f"{ax} 良好（mock）",
+                        "confidence": ["low", "medium"][i % 2]}
+                   for i, (ax, p) in enumerate(schema.get("properties", {}).items())
+                   if isinstance(p, dict) and "assessment" in p.get("properties", {})}
+            out.update({
                 "prior_art": [{"citation": "mock 2025", "source_tier": "preprint", "relation": "類似だが差分あり"}],
                 "verdict": v,
                 "kill_reason": "完全な先行事例あり（mock）" if v == "kill" else "",
                 "notes": "mock verdict",
-            }
+            })
+            return out
         raise RunnerError(f"unknown kind {kind}")
 
 
@@ -550,6 +578,7 @@ def planner(seed, constraints, cfg, run):
     charter = {
         "seed": seed,
         "constraints": constraints,
+        "domain": cfg.get("domain", ""),
         "eval_axes": cfg["eval_axes"],
         "lenses": cfg["lenses"][: cfg["n_lenses"]],
         "engines": (cfg.get("engines", ["codex", "claude"]) if cfg["engine"] == "dual"
@@ -590,6 +619,7 @@ def generate(runner, charter, cfg, run, mem):
     engines が複数なら engine をレンズに割り当てる(Codex + Claude Code 両方 = default)。"""
     tmpl = load_prompt("ideator")
     lenses = charter["lenses"]
+    lens_desc_map = {**LENS_DESC, **cfg.get("lens_desc", {})}   # config で説明を上書き/追加(P1)
     digest = memory_digest(mem)
 
     engines = list(charter.get("engines") or ["mock"])   # main で live なものに絞り済み
@@ -607,7 +637,8 @@ def generate(runner, charter, cfg, run, mem):
         label = f"{run['id']}__gen_{i:02d}__{lens}"
         eng = assign[i]
         prompt = render(tmpl, seed=charter["seed"], constraints=charter["constraints"],
-                        lens=lens, lens_desc=LENS_DESC.get(lens, lens), memory=digest,
+                        lens=lens, lens_desc=lens_desc_map.get(lens, lens), memory=digest,
+                        domain_note=cfg.get("seed_charter_note", ""),
                         schema=json.dumps(HYPOTHESIS_SCHEMA, ensure_ascii=False))
         used = eng
         used_label = label
@@ -650,6 +681,7 @@ def generate(runner, charter, cfg, run, mem):
 def redteam(runner, cands, cfg, run):
     """cross red-team: 攻撃 -> 検証可能項目に変換。judge しない。"""
     tmpl = load_prompt("redteam")
+    extra_checks = "\n".join(f"- {x}" for x in cfg.get("redteam_extra_checks", [])) or "(なし)"
 
     def one(c):
         label = f"{run['id']}__review_{c['id']}"
@@ -657,6 +689,7 @@ def redteam(runner, cands, cfg, run):
         shown = {k: v for k, v in c.items()
                  if not k.startswith("_") and k not in ("id", "provenance")}
         prompt = render(tmpl, candidate=json.dumps(shown, ensure_ascii=False, indent=2),
+                        extra_checks=extra_checks,
                         schema=json.dumps(REVIEW_SCHEMA, ensure_ascii=False))
         try:
             return c["id"], runner.run(prompt, REVIEW_SCHEMA, "review", label, run["log"])
@@ -726,6 +759,7 @@ def _search_terms(text, max_terms):
         "the", "and", "for", "with", "from", "that", "this", "into", "using", "use",
         "has", "have", "are", "was", "were", "can", "could", "would", "should",
         "study", "research", "method", "effect", "data", "analysis", "test",
+        "off", "non", "via", "per",   # ON/OFF 等から混入するノイズ語(NTRS は AND 検索なので致命的)
     }
     terms = []
     for tok in re.findall(r"[A-Za-z][A-Za-z0-9+_.-]{2,}", text):
@@ -739,6 +773,22 @@ def _search_terms(text, max_terms):
     return terms
 
 
+def _candidate_terms(c, cfg):
+    """文献検索語: 候補自身の search_keywords(英語・LLM 生成)を優先。
+    無ければ本文から ASCII 抽出(従来)— 日本語契約だとジャーゴンしか拾えずリコールが落ちる。"""
+    kws = []
+    for kw in (c.get("search_keywords") or []):
+        for tok in str(kw).split():
+            t = tok.strip().lower()
+            if len(t) >= 2 and t not in kws:
+                kws.append(t)
+    if kws:
+        return kws[: int(cfg.get("lit_search_max_terms", 6))]
+    text = " ".join(str(c.get(k, "")) for k in
+                    ("question", "hypothesis", "novelty_claim", "test_method"))
+    return _search_terms(text, int(cfg.get("lit_search_max_terms", 6)))
+
+
 def collect_prior_art(c, cfg, run):
     """Tier0 novelty の補助: arXiv API から候補文献を取り、artifact として残す。"""
     if not cfg.get("lit_search_enabled", True):
@@ -746,9 +796,7 @@ def collect_prior_art(c, cfg, run):
         write_json(run, f"evidence/{c['id']}.arxiv.json", data)
         return data
 
-    text = " ".join(str(c.get(k, "")) for k in
-                    ("question", "hypothesis", "novelty_claim", "test_method"))
-    terms = _search_terms(text, int(cfg.get("lit_search_max_terms", 6)))
+    terms = _candidate_terms(c, cfg)
     if not terms:
         data = {"enabled": True, "query": "", "results": [], "error": "no_ascii_search_terms"}
         write_json(run, f"evidence/{c['id']}.arxiv.json", data)
@@ -793,14 +841,26 @@ def collect_prior_art(c, cfg, run):
 
 
 def collect_inspire(c, cfg, run):
-    """Tier0 novelty 補助: INSPIRE-HEP(HEP の権威DB)から候補文献を取り artifact 化。"""
-    if not cfg.get("inspire_enabled", True):
+    """Tier0 novelty 補助: INSPIRE-HEP(HEP の権威DB)から候補文献を取り artifact 化。
+    inspire_mode(Issue #40 P4): always(HEP 既定) | trigger(候補文に trigger 語がある時だけ
+    cross-domain hint として引く。spacecraft 等の隣接分野用) | off。
+    未指定なら従来の inspire_enabled から導出(後方互換)。"""
+    mode = cfg.get("inspire_mode") or ("always" if cfg.get("inspire_enabled", True) else "off")
+    if mode == "off":
         data = {"enabled": False, "query": "", "results": [], "error": ""}
         write_json(run, f"evidence/{c['id']}.inspire.json", data)
         return data
     text = " ".join(str(c.get(k, "")) for k in
                     ("question", "hypothesis", "novelty_claim", "test_method"))
-    terms = _search_terms(text, int(cfg.get("lit_search_max_terms", 6)))
+    if mode == "trigger":
+        low = text.lower()
+        trig = [str(t).lower() for t in cfg.get("inspire_trigger_terms", [])]
+        if not any(t in low for t in trig):
+            data = {"enabled": False, "query": "", "results": [],
+                    "error": "", "skipped": "no_trigger_terms"}
+            write_json(run, f"evidence/{c['id']}.inspire.json", data)
+            return data
+    terms = _candidate_terms(c, cfg)
     if not terms:
         data = {"enabled": True, "query": "", "results": [], "error": "no_ascii_search_terms"}
         write_json(run, f"evidence/{c['id']}.inspire.json", data)
@@ -826,10 +886,13 @@ def collect_inspire(c, cfg, run):
             authors = [a.get("full_name", "") for a in (m.get("authors") or [])[:5] if a.get("full_name")]
             year = (m.get("earliest_date", "") or "")[:4]
             eprint = (m.get("arxiv_eprints") or [{}])[0].get("value", "")
+            rel = ("INSPIRE-HEP cross-domain hint (trigger mode); verifier must assess relation"
+                   if mode == "trigger" else
+                   "INSPIRE-HEP search candidate; verifier must assess relation")
             data["results"].append({
                 "citation": f"{', '.join(authors)} ({year}), {title}".strip(),
                 "source_tier": "authoritative_db",  # INSPIRE は査読・curated メタデータの権威DB
-                "relation": "INSPIRE-HEP search candidate; verifier must assess relation",
+                "relation": rel,
                 "url": (f"https://arxiv.org/abs/{eprint}" if eprint else ""),
             })
     except Exception as e:
@@ -838,26 +901,93 @@ def collect_inspire(c, cfg, run):
     return data
 
 
+def collect_ntrs(c, cfg, run):
+    """Tier0 novelty 補助: NASA NTRS(航空宇宙の curated STI リポジトリ)から候補文献を取り artifact 化。
+    metadata-only(full text は取らない / Issue #40 P4)。spacecraft domain の primary provider。"""
+    if not cfg.get("ntrs_enabled", False):
+        data = {"enabled": False, "query": "", "results": [], "error": ""}
+        write_json(run, f"evidence/{c['id']}.ntrs.json", data)
+        return data
+    terms = _candidate_terms(c, cfg)
+    if not terms:
+        data = {"enabled": True, "query": "", "results": [], "error": "no_ascii_search_terms"}
+        write_json(run, f"evidence/{c['id']}.ntrs.json", data)
+        return data
+    n = int(cfg.get("lit_search_max_results", 5))
+    url = "https://ntrs.nasa.gov/api/citations/search"
+
+    def _post(query):
+        timeout = int(cfg.get("lit_search_timeout_sec", 15))
+        payload = json.dumps({"q": query, "page": {"size": n, "from": 0}}).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=payload,
+            headers={"User-Agent": "claude-codex-orchestrator/0.1",
+                     "Content-Type": "application/json", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+
+    # NTRS は全語 AND(OR 構文なし)。語を絞らないとリコール不足(実測)。
+    # 4語で 0 件なら上位2語で1回だけ再検索(recall fallback)。
+    q = " ".join(terms[:4])
+    data = {"enabled": True, "query": q, "url": url, "results": [], "error": ""}
+    try:
+        hits = list(_post(q).get("results") or [])
+        # 結果が薄ければ上位2語で広げ、id で重複排除してマージ(AND 検索はリコールが落ちやすい)
+        if len(hits) < 2 and len(terms) > 2:
+            q2 = " ".join(terms[:2])
+            data["query"] = f"{q} | fallback: {q2}"
+            seen_ids = {h.get("id") for h in hits}
+            hits += [h for h in (_post(q2).get("results") or []) if h.get("id") not in seen_ids]
+        for hit in hits[:n]:
+            title = " ".join(str(hit.get("title", "")).split())
+            authors = []
+            for aa in (hit.get("authorAffiliations") or [])[:5]:
+                name = (((aa.get("meta") or {}).get("author") or {}).get("name", ""))
+                if name:
+                    authors.append(name)
+            pubs = hit.get("publications") or [{}]
+            year = (str(pubs[0].get("publicationDate", "")) or str(hit.get("distributionDate", "")))[:4]
+            sti = hit.get("stiType", "")
+            cid = hit.get("id", "")
+            abstract = " ".join(str(hit.get("abstract", "")).split())[:300]
+            data["results"].append({
+                "citation": f"{', '.join(authors)} ({year}), {title}" + (f" [NTRS:{sti}]" if sti else ""),
+                "source_tier": "authoritative_db",  # NASA の curated STI リポジトリ
+                "relation": "NASA NTRS search candidate; verifier must assess relation",
+                "url": (f"https://ntrs.nasa.gov/citations/{cid}" if cid else ""),
+                "abstract_snippet": abstract,
+            })
+    except Exception as e:
+        data["error"] = str(e)
+    write_json(run, f"evidence/{c['id']}.ntrs.json", data)
+    return data
+
+
 def collect_evidence(c, cfg, run):
-    """Tier0 novelty 補助の集約: arXiv(preprint) + INSPIRE-HEP(authoritative_db)。
+    """Tier0 novelty 補助の集約: arXiv(preprint) + INSPIRE-HEP + NASA NTRS(authoritative_db)。
+    どれを引くかは config 駆動(inspire_mode / ntrs_enabled — Issue #40)。
     §8 Read プレーン: 許可した read-only API のみ叩き、結果はスナップショット保存。"""
     if not cfg.get("lit_search_enabled", True):
         empty = {"enabled": False, "query": "", "results": [], "error": ""}
-        write_json(run, f"evidence/{c['id']}.arxiv.json", empty)
-        write_json(run, f"evidence/{c['id']}.inspire.json", empty)
-        return {"arxiv": empty, "inspire": empty}
+        for prov in ("arxiv", "inspire", "ntrs"):
+            write_json(run, f"evidence/{c['id']}.{prov}.json", empty)
+        return {"arxiv": empty, "inspire": empty, "ntrs": empty}
     return {"arxiv": collect_prior_art(c, cfg, run),
-            "inspire": collect_inspire(c, cfg, run)}
+            "inspire": collect_inspire(c, cfg, run),
+            "ntrs": collect_ntrs(c, cfg, run)}
 
 
 def evidence_refs(c):
-    return [f"evidence/{c['id']}.arxiv.json", f"evidence/{c['id']}.inspire.json"]
+    return [f"evidence/{c['id']}.{prov}.json" for prov in ("arxiv", "inspire", "ntrs")]
 
 
 def verify(runner, cands, cfg, run, mem):
     """Tier0 検証: 形(決定的) + 文献/soundness/feasibility(独立な検証呼び出し)。"""
     tmpl = load_prompt("verifier")
     required = HYPOTHESIS_SCHEMA["required"]
+    axes = cfg.get("eval_axes", DEFAULT_EVAL_AXES)
+    vschema = verdict_schema(axes)
+    extra_axes = extra_axes_text(axes, cfg)
 
     def form_ok(c):
         missing = [k for k in required if k in ("assumptions", "unknowns")
@@ -883,24 +1013,23 @@ def verify(runner, cands, cfg, run, mem):
                         candidate=json.dumps({k: v for k, v in c.items() if not k.startswith("_")},
                                              ensure_ascii=False, indent=2),
                         todo="\n".join(todo_items) or "(なし)",
+                        extra_axes=extra_axes,
                         prior_art_hint=json.dumps(prior_art_hint, ensure_ascii=False, indent=2),
-                        schema=json.dumps(VERDICT_SCHEMA, ensure_ascii=False))
+                        schema=json.dumps(vschema, ensure_ascii=False))
         try:
-            verdict = runner.run(prompt, VERDICT_SCHEMA, "verdict", label, run["log"])
+            verdict = runner.run(prompt, vschema, "verdict", label, run["log"])
             verdict["provenance"] = provenance(run, cfg, "verify", label, target=c["id"])
             verdict["evidence_refs"] = evidence_refs(c)
             return c["id"], verdict
         except Exception as e:
             log(run, f"  [verify {c['id']}] FAILED: {e}")
-            return c["id"], {"verdict": "flag", "kill_reason": "",
-                              "notes": f"検証エラー(要再実行): {e}",
-                              "novelty": {"assessment": "未検証", "confidence": "low"},
-                              "soundness": {"assessment": "未検証", "confidence": "low"},
-                              "feasibility": {"assessment": "未検証", "confidence": "low"},
-                              "significance": {"assessment": "未検証", "confidence": "low"},
-                              "prior_art": [],
-                              "provenance": provenance(run, cfg, "verify", label, target=c["id"]),
-                              "evidence_refs": evidence_refs(c)}
+            fb = {"verdict": "flag", "kill_reason": "",
+                  "notes": f"検証エラー(要再実行): {e}", "prior_art": [],
+                  "provenance": provenance(run, cfg, "verify", label, target=c["id"]),
+                  "evidence_refs": evidence_refs(c)}
+            for ax in axes:
+                fb[ax] = {"assessment": "未検証", "confidence": "low"}
+            return c["id"], fb
 
     verdicts = dict(_parallel(cfg, [(one, (c,)) for c in cands]))
     for c in cands:
@@ -939,8 +1068,11 @@ def hard_gate(cands, run):
     return survivors
 
 
-def arbiter(survivors, run):
-    """idea段の Arbiter = 整理係。勝者を選ばず matrix を人間に出す。"""
+def arbiter(survivors, run, axes=None):
+    """idea段の Arbiter = 整理係。勝者を選ばず matrix を人間に出す。
+    評価軸は config の eval_axes 駆動(P0: 以前は4軸ハードコードだった)。"""
+    axes = list(axes or DEFAULT_EVAL_AXES)
+
     def cell(v, axis):
         a = v.get(axis, {})
         txt = str(a.get("assessment", "-")).replace("\n", " ").replace("|", "/")
@@ -952,34 +1084,36 @@ def arbiter(survivors, run):
     for c in survivors:
         v = c.get("_verdict", {})
         status = "kill?(LLM/要確認)" if c.get("_llm_kill") else v.get("verdict", "?")
-        rows.append({
+        row = {
             "id": c["id"], "lens": c.get("_lens", "?"), "engine": c.get("_engine", "?"),
             "verdict": status, "risk_type": c.get("risk_type", ""),
             "hypothesis": c.get("hypothesis", ""),
-            "novelty": cell(v, "novelty"), "soundness": cell(v, "soundness"),
-            "feasibility": cell(v, "feasibility"), "significance": cell(v, "significance"),
             "cheapest_kill": c.get("cheapest_kill", ""),
-        })
+        }
+        for ax in axes:
+            row[ax] = cell(v, ax)
+        rows.append(row)
     # 透明な並べ替え: keep→flag→kill?(LLM)。同順位は high/medium confidence 数(単一スコアに潰さない)
     def score(r):
         order = {"keep": 0, "flag": 1}.get(r["verdict"], 2)   # kill?(LLM/要確認) は 2
-        strong = sum(("high" in r[a] or "medium" in r[a]) for a in
-                     ("novelty", "soundness", "feasibility", "significance"))
+        strong = sum(("high" in r[ax] or "medium" in r[ax]) for ax in axes)
         return (order, -strong)
     rows.sort(key=score)
     write_json(run, "decision_matrix.json", rows)
 
+    header = "| id | lens | engine | verdict | risk | " + " | ".join(axes) + " | cheapest_kill |"
+    sep = "|" + "---|" * (6 + len(axes))
     md = ["# decision_matrix (人間が読む)\n",
           "**勝者は選んでいない。** AIは候補を出し客観検証しただけ。",
           "どの生存案に *実験予算* を割くかは人間が決める(ARCHITECTURE §3.7 / §5)。\n",
           "verdict 凡例: `keep` / `flag`(通説違反など要注目で残す) / "
           "`kill?(LLM/要確認)`=LLM は kill 推奨だが客観未確認 → 人間が棄却の妥当性を判断。\n",
-          "| id | lens | engine | verdict | risk | novelty | soundness | feasibility | significance | cheapest_kill |",
-          "|---|---|---|---|---|---|---|---|---|---|"]
+          header, sep]
     for r in rows:
-        md.append("| {id} | {lens} | {engine} | {verdict} | {risk_type} | {novelty} | {soundness} | "
-                  "{feasibility} | {significance} | {cheapest_kill} |".format(
-                      **{k: str(v).replace("|", "/").replace("\n", " ") for k, v in r.items()}))
+        cells = [r["id"], r["lens"], r["engine"], r["verdict"], r["risk_type"]]
+        cells += [r[ax] for ax in axes]
+        cells.append(r["cheapest_kill"])
+        md.append("| " + " | ".join(str(x).replace("|", "/").replace("\n", " ") for x in cells) + " |")
     md.append("\n## 各候補の仮説\n")
     for r in rows:
         md.append(f"- **{r['id']}** ({r['lens']}): {r['hypothesis']}")
@@ -1008,6 +1142,7 @@ def report(charter, survivors, all_cands, run):
     md = [f"# RUN REPORT — {run['id']}\n",
           f"- seed: **{charter['seed']}**",
           f"- constraints: {charter['constraints'] or '(なし)'}",
+          *([f"- domain: {charter['domain']}"] if charter.get("domain") else []),
           f"- engine: {run['engine']} / model: {run['model']}  (生成 engine 内訳: {eng_bd})",
           f"- 生成 {len(all_cands)} / 生存 {len(survivors)} / 客観棄却 {len(all_cands)-len(survivors)}"
           + (f" / 内 LLM-kill推奨 {sum(1 for c in survivors if c.get('_llm_kill'))}(要人間確認)"
@@ -1022,7 +1157,7 @@ def report(charter, survivors, all_cands, run):
           "2. `candidates/*.json` … 各 Research Hypothesis Contract。",
           "3. `reviews/*.json` … red-team の攻撃(検証項目へ変換済み)。",
           "4. `revised/*.json` … red-team 後の改訂版。原案は `candidates/` に残る。",
-          "5. `evidence/*.json` … arXiv(preprint)/INSPIRE-HEP(権威DB)から機械的に収集した検証補助データ。",
+          "5. `evidence/*.json` … arXiv(preprint)/INSPIRE-HEP/NASA NTRS(権威DB)から機械的に収集した検証補助データ。",
           "6. `verdicts/*.json` … Tier0 検証結果(novelty/soundness/feasibility + prior_art)。",
           "7. `discarded.md` … hard gate 落ち(理由付き)。 `unresolved.md` … 未解決・未追跡変種。",
           "",
@@ -1091,7 +1226,9 @@ DEFAULT_CFG = {
     "lenses": ["analogy", "anomaly", "method-driven", "contrarian", "gap", "combination"],
     "eval_axes": ["novelty", "soundness", "feasibility", "significance"],
     "lit_search_enabled": True, "lit_search_max_terms": 6,
-    "lit_search_max_results": 5, "lit_search_timeout_sec": 15, "inspire_enabled": True,
+    "lit_search_max_results": 5, "lit_search_timeout_sec": 15,
+    "inspire_enabled": True,   # inspire_mode(always|trigger|off)未指定時はここから導出
+    "ntrs_enabled": False,     # NASA NTRS(spacecraft domain で有効化)
     "queue_poll_sec": 3, "queue_timeout_sec": 600,
     "session_warmup_sec": 8, "inject_enter_delay_sec": 1.5,
 }
@@ -1184,7 +1321,7 @@ def main():
         log(run, "[6/7] HARD GATE— kill を捨て案台帳へ")
         survivors = hard_gate(cands, run)
         log(run, "[7/7] ARBITER  — 整理(勝者は選ばない)")
-        arbiter(survivors, run)
+        arbiter(survivors, run, charter["eval_axes"])
         write_unresolved(cands, run)
         report(charter, survivors, cands, run)
         append_seen(run, cands)                     # 自動メモリ(重複検知用)に追記

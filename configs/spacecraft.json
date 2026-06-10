@@ -1,0 +1,41 @@
+{
+  "domain": "spacecraft-research",
+
+  "lenses": ["telemetry_and_diagnostics", "physics_mechanism", "modeling_and_simulation", "validation_strategy", "prior_art_difference"],
+  "n_lenses": 5,
+  "lens_desc": {
+    "physics_mechanism":        "宇宙機に関する物理・工学メカニズムに基づく研究仮説を出す(単なる設計改善ではない)。",
+    "modeling_and_simulation":  "toy model / 数値シミュレーションに落とせる研究仮説を出す。",
+    "telemetry_and_diagnostics":"テレメトリ・FDIR・異常検知に関する検証可能な研究仮説を出す。",
+    "validation_strategy":      "最初に安く検証・棄却できる(cheapest_kill が明確な)研究仮説を出す。",
+    "prior_art_difference":     "既存研究との差分が明確な研究仮説を出す。"
+  },
+
+  "eval_axes": ["novelty", "soundness", "feasibility", "significance", "mechanism_clarity", "validation_clarity", "baseline_clarity"],
+
+  "lit_search_enabled": true,
+  "inspire_mode": "trigger",
+  "inspire_trigger_terms": ["radiation", "cosmic", "particle detector", "charged particle", "daq", "calorimeter", "plasma", "high energy", "scintillator", "dosimetry", "spectrometer", "放射線", "宇宙線", "粒子検出器", "プラズマ", "線量", "シンチレータ"],
+  "ntrs_enabled": true,
+
+  "seed_charter_note": "宇宙機の『開発・運用改善』ではなく『研究の種』を出すこと。可能なら baseline / success_metric / failure_condition を埋める。",
+
+  "redteam_extra_checks": [
+    "too_close_to_product_development(研究仮説ではなく単なる開発改善・運用効率化に寄りすぎていないか)",
+    "weak_physical_mechanism(物理・工学メカニズムが弱くないか)",
+    "no_toy_model_path(toy model / 初期シミュレーションに落とせないのではないか)",
+    "unclear_baseline(比較すべき baseline が不明確ではないか)",
+    "unclear_success_metric(成功指標が曖昧ではないか)",
+    "unclear_failure_condition(失敗条件が曖昧ではないか)",
+    "no_initial_validation_data(公開/合成データ・シミュレーションで初期検証できないのではないか)"
+  ],
+
+  "_comment": {
+    "domain": "spacecraft-research = 宇宙機開発支援ではなく、宇宙機を対象にした『研究の種出し』(Issue #40)。",
+    "usage": "python orchestrate.py --config configs/spacecraft.json --seed \"...\"",
+    "lenses": "先頭から n_lenses 個を使う(順序=優先度。MVP はテレメトリ/熱/電力/FDIR/デジタルツイン重視で telemetry を先頭に)。",
+    "inspire_mode": "always|trigger|off。spacecraft は trigger(放射線/検出器/DAQ 等の語がある時だけ INSPIRE を cross-domain hint として引く)。",
+    "providers": "arXiv + NASA NTRS を primary、INSPIRE を trigger 時の secondary、ADS/TechPort は後回し。",
+    "_design": "config-driven: lenses/lens_desc/eval_axes/providers/redteam_extra_checks は全て config 側で定義。orchestrate.py 本体や domains/ framework は不要(ADR-002)。engine/concurrency/timeout 等は DEFAULT_CFG を継承。"
+  }
+}

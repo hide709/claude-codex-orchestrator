@@ -31,6 +31,9 @@ python orchestrate.py --seed "..." --n-lenses 6
 # engine を明示(default は dual)
 python orchestrate.py --seed "..." --engine codex           # codex のみ
 python orchestrate.py --seed "..." --engine claude          # claude のみ
+
+# ドメインを切り替える(例: 宇宙機研究)
+python orchestrate.py --config configs/spacecraft.json --seed "..."
 ```
 
 出力は `runs/<timestamp>-<slug>/` に出る。まず `REPORT.md` と `decision_matrix.md` を読む。
@@ -88,6 +91,22 @@ python orchestrate.py --engine mock --no-lit-search --seed "queue test"
   `--no-lit-search` で一括無効化(offline/高速テスト用)。
 - **検証ゲートの方針**: 自動 reject は**客観基準(形不備など)のみ**。LLM の `kill` は推奨扱いで落とさず、
   `decision_matrix` に `kill?(LLM/要確認)` として残す(誤kill救済 / ARCHITECTURE §3.6)。
+
+## ドメイン設定(domain config / Issue #40)
+既定(`config.json`)は HEP/加速器向け。**workflow は変えず**、config だけでドメインを差し替える:
+
+```bash
+python orchestrate.py --config configs/spacecraft.json --seed "宇宙機テレメトリの熱モデル残差で熱系異常を早期検知できるか"
+```
+
+domain config で差し替わるもの(`configs/spacecraft.json` が実例):
+- `lenses` + `lens_desc` … 発散レンズと説明(spacecraft: telemetry_and_diagnostics / physics_mechanism / modeling_and_simulation / validation_strategy / prior_art_difference)
+- `eval_axes` … decision_matrix / verdict の評価軸。既定4軸に **mechanism_clarity / validation_clarity / baseline_clarity** を追加(軸は増やしても単一スコアには潰さない)
+- evidence providers … spacecraft は **arXiv + NASA NTRS** が primary。**INSPIRE は `inspire_mode: "trigger"`**(放射線/検出器/プラズマ等の語が候補に含まれる時だけ cross-domain hint として検索)。ADS/TechPort は未実装(後回し)
+- `redteam_extra_checks` … red-team の追加観点。**`too_close_to_product_development`(研究仮説ではなく開発改善案に寄りすぎ)** が spacecraft の要
+- `seed_charter_note` … ideator への域内指示(「開発案でなく研究の種を出す」等)
+
+contract には任意フィールド `baseline` / `success_metric` / `failure_condition` を追加(全分野で有効、未記入でも形ゲートは通る)。
 
 ## メモリ(cross-run / Issue #23)
 run をまたいで「却下した線・採用した方向・好み」を覚え、**次回の生成と検証に反映**する。
