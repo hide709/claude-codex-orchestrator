@@ -16,6 +16,7 @@ orchestrate.py — IDEA-stage funnel MVP   (see ARCHITECTURE.md §11)
 """
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -171,8 +172,19 @@ def _resolve_engine_exe(engine, cfg):
     return None
 
 
+def _winpty_available():
+    """対話セッション駆動(ADR-001)の前提: Windows + pywinpty。"""
+    return os.name == "nt" and importlib.util.find_spec("winpty") is not None
+
+
 def engine_available(engine, cfg):
-    return engine == "mock" or _resolve_engine_exe(engine, cfg) is not None
+    """mock は常に可。codex/claude は Windows + pywinpty + 実行ファイル解決 が揃って初めて可
+    (揃っていないのに _spawn まで進んで生 ImportError で落ちるのを防ぐ)。"""
+    if engine == "mock":
+        return True
+    if not _winpty_available():
+        return False
+    return _resolve_engine_exe(engine, cfg) is not None
 
 
 def _engine_argv(engine, exe, seed, cfg):
@@ -205,6 +217,7 @@ class InteractiveSessionRunner:
         self.timeout = cfg.get("queue_timeout_sec", cfg.get("timeout_sec", 600))
         self.warmup = cfg.get("session_warmup_sec", 8)
         self.enter_delay = cfg.get("inject_enter_delay_sec", 1.5)
+        self.buf_max = int(cfg.get("session_buffer_max_chunks", 256))  # TUI 出力の保持上限(チャンク数)
         self.proc = None
         self._buf = []
         self._blk = threading.Lock()
@@ -218,7 +231,12 @@ class InteractiveSessionRunner:
                 f"queue/{self.engine}/reports/{label}.json へ rename してください。説明やコードフェンスは書かない。")
 
     def _spawn(self, seed):
-        from winpty import PtyProcess  # 遅延 import(mock/offline は pywinpty 不要)
+        try:
+            from winpty import PtyProcess  # 遅延 import(mock/offline は pywinpty 不要)
+        except ImportError as e:
+            raise RunnerError(
+                f"pywinpty が import できない({e})。Windows で `pip install -r requirements.txt` を実行"
+            ) from e
         if self.exe is None:
             raise RunnerError(f"{self.engine} の実行ファイルが見つからない(PATH/既定の場所に無い)")
         self.proc = PtyProcess.spawn(_engine_argv(self.engine, self.exe, seed, self.cfg),
@@ -233,16 +251,36 @@ class InteractiveSessionRunner:
                 if d:
                     with self._blk:
                         self._buf.append(d)
+                        if len(self._buf) > self.buf_max:      # 無制限に溜めない(_dump は tail しか使わない)
+                            del self._buf[: len(self._buf) - self.buf_max]
                 else:
                     time.sleep(0.05)
         threading.Thread(target=_readloop, daemon=True).start()
         time.sleep(self.warmup)   # 起動待ち
 
+    def _cleanup(self, files, logdir, label, save_invalid=False):
+        """queue/ にファイルを溜めない(成功時は即、失敗時も job の残骸を掃除)。
+        save_invalid: parse できなかった report を削除前に log へ退避。"""
+        report_f = self.qout / f"{label}.json"
+        if save_invalid and report_f.exists():
+            try:
+                (logdir / f"{label}.invalid-report.txt").write_text(
+                    report_f.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+            except OSError:
+                pass
+        for p in files:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     def run(self, prompt, schema, kind, label, logdir):
         with self._lock:
             inbox_f = self.qin / f"{label}.json"
             report_f = self.qout / f"{label}.json"
-            tmp_f = self.qin / f".{label}.tmp"
+            report_tmp = self.qout / f"{label}.json.tmp"   # worker が rename 前に書く側
+            # 同一 label を扱う別プロセスと衝突しないよう pid/tid で一意化
+            tmp_f = self.qin / f".{label}.{os.getpid()}.{threading.get_ident()}.tmp"
             if report_f.exists():
                 report_f.unlink()
             tmp_f.write_text(json.dumps(
@@ -268,13 +306,17 @@ class InteractiveSessionRunner:
                         continue
                     (logdir / f"{label}.log.txt").write_text(
                         f"[{self.engine}-session] {label}\n--- report ---\n{raw}", encoding="utf-8")
+                    self._cleanup((inbox_f, report_f, report_tmp), logdir, label)   # log に残したので queue は掃除
                     return data
                 if self.proc is not None and not self.proc.isalive():
                     self._dump(logdir, label, "session が終了(report 未生成)")
+                    self._cleanup((inbox_f, report_f, report_tmp), logdir, label, save_invalid=True)
                     raise RunnerError(f"{self.engine} session が終了(report 未生成) label={label}")
                 time.sleep(self.poll)
                 waited += self.poll
             self._dump(logdir, label, f"timeout {self.timeout}s")
+            # parse できない report が残っていれば log/<label>.invalid-report.txt に退避してから掃除
+            self._cleanup((inbox_f, report_f, report_tmp), logdir, label, save_invalid=True)
             raise RunnerError(f"{self.engine} session timeout ({self.timeout}s) label={label}")
 
     def _dump(self, logdir, label, note):
@@ -1094,6 +1136,7 @@ DEFAULT_CFG = {
     "lit_search_max_results": 5, "lit_search_timeout_sec": 15, "inspire_enabled": True,
     "queue_poll_sec": 3, "queue_timeout_sec": 600,
     "session_warmup_sec": 8, "inject_enter_delay_sec": 1.5,
+    "session_buffer_max_chunks": 256,   # TUI 出力バッファの保持上限(チャンク数。診断 tail 用)
 }
 
 
@@ -1161,6 +1204,9 @@ def main():
     live = usable_engines(charter["engines"], cfg)
     if not live:
         print(f"使える engine がありません(要求: {charter['engines']})。")
+        if not _winpty_available():
+            print("  対話セッション駆動には Windows + pywinpty が必要です:"
+                  " `pip install -r requirements.txt`(Windows 以外は未対応 / ADR-001)。")
         print("  codex / claude が PATH か既定の場所にあるか確認(新しいターミナルの PATH に入っているか)。")
         print("  配管だけ確認するなら: --engine mock")
         sys.exit(1)
