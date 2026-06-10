@@ -108,7 +108,7 @@ domain config で差し替わるもの(`configs/spacecraft.json` が実例):
 - `redteam_extra_checks` … red-team の追加観点。**`too_close_to_product_development`(研究仮説ではなく開発改善案に寄りすぎ)** が spacecraft の要
 - `seed_charter_note` … ideator への域内指示(「開発案でなく研究の種を出す」等)
 
-contract には任意フィールド `baseline` / `success_metric` / `failure_condition` を追加(全分野で有効、未記入でも形ゲートは通る)。
+contract には任意フィールド `baseline` / `success_metric` / `failure_condition` / `search_keywords` を追加(全分野で有効、未記入でも形ゲートは通る)。`search_keywords` は文献検索用の英語キーワードで、NTRS/arXiv/INSPIRE collector が候補本文からの語抽出より**優先して**使う(日本語契約でも検索リコールを確保するため)。
 
 ## メモリ(cross-run / Issue #23)
 run をまたいで「却下した線・採用した方向・好み」を覚え、**次回の生成と検証に反映**する。
