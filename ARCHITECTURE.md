@@ -165,6 +165,11 @@
   - **idea段階で勝者を選ばない**(客観指標が無い所で LLM に裁かせると §0 が壊れる)。
   - **soft score を単一値に潰さない**(matrix のまま人間へ)。
   - 妥当性を再判定しない(gate 通過は前提として扱う)。
+- **priority_for_next_round(Issue #37):** matrix に併記される配分指針は **ranking ではなく allocation**
+  — 「次ラウンドの**追加**検証予算をどこに使うか」を既存 artifact(軸 confidence / unknowns / flag /
+  重複)から**決定的に**計算したもの(LLM 不使用)。採用/棄却には使わない。**floor 保証**: 低 priority でも
+  棄却されず baseline 検証は全員が受け続ける(de-facto kill の禁止)。AI debate / pairwise を信号に使う場合も
+  argument_trace(#36)として evidence と分離し、opt-in とする。
 
 ### 3.8 ARTIFACT BUS
 - **責務:** 全コンポーネント間の受け渡しをファイルで行う(YAML/MD/JSON/diff)。

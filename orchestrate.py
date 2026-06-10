@@ -393,7 +393,10 @@ class MockRunner:
 
     def run(self, prompt, schema, kind, label, logdir):
         (logdir / f"{label}.log.txt").write_text(f"[mock] {label}\n{prompt[:400]}", encoding="utf-8")
-        idx = int(re.search(r"(\d+)", label).group(1)) if re.search(r"(\d+)", label) else 0
+        # 候補番号(rq-NN / gen_NN)を優先して拾う。label 先頭の run id(タイムスタンプ)に
+        # マッチすると idx==1 の kill 分岐が一生発火しない(mock の gate/priority 検証が死ぬ)
+        m = re.search(r"(?:rq-|gen_)(\d+)", label) or re.search(r"(\d+)", label)
+        idx = int(m.group(1)) if m else 0
         if kind == "hypothesis":
             lens = label.split("__")[-1]
             return {
@@ -652,7 +655,8 @@ def planner(seed, constraints, cfg, run):
         "engines": (cfg.get("engines", ["codex", "claude"]) if cfg["engine"] == "dual"
                     else [cfg["engine"]]),
         "lit_search_enabled": cfg.get("lit_search_enabled", True),
-        "rounds": 1,
+        "rounds": 1,                              # 実行される round 数(>1 の実行は #38)
+        "budget": cfg.get("_budget") or {"profile": "(none)"},   # 要求プロファイルの記録(#37)
         "created": run["created"],
     }
     write_json(run, "charter.json", charter)
@@ -1235,6 +1239,62 @@ def hard_gate(cands, run):
     return survivors
 
 
+PRIORITY_ACTION = {   # 最も confidence が低い軸 → 追加予算の使い道(決定的マッピング)
+    "novelty":      "deeper-lit-search",
+    "soundness":    "soundness-derivation-check",
+    "feasibility":  "toy-computation",
+    "significance": "human-judgement",
+}
+
+
+def priority_for_next_round(survivors, axes, run):
+    """次ラウンドの**追加**計算資源(深掘り red-team / 追加文献 / evolution 枠)の配分指針(Issue #37)。
+    **採用判定ではない**(ranking ではなく allocation)。既存 artifact の信号だけから決定的に計算
+    (LLM 不使用)。floor 保証: priority が低くても棄却されず、baseline 検証は全員が受け続ける。
+    pairwise/debate 由来の信号は v1 では使わない(opt-in v2 / #36 の argument_trace 経由)。"""
+    rows = []
+    for c in survivors:
+        v = c.get("_verdict", {}) or {}
+        conf = {ax: (v.get(ax) or {}).get("confidence", "low") for ax in axes}
+        breakdown = {   # 透明性: スカラに潰さず内訳を artifact に残す
+            "uncertainty_low_axes":   2 * sum(1 for x in conf.values() if x == "low"),
+            "uncertainty_med_axes":   1 * sum(1 for x in conf.values() if x == "medium"),
+            "open_unknowns":          min(len(c.get("unknowns") or []), 5),
+            "flag_attention":         2 if v.get("verdict") == "flag" else 0,
+            "llm_kill_review":        1 if c.get("_llm_kill") else 0,      # 棄却理由の人間確認という追加作業
+            "cluster_non_representative": -2 if c.get("_cluster_rep") else 0,  # 代表が同方向をカバー(#34)
+            "past_duplicate":         -1 if c.get("_near_dup") else 0,
+        }
+        low_axes = [ax for ax in axes if conf[ax] == "low"]
+        if c.get("_llm_kill"):
+            action = "human-review-kill-reason"
+        elif low_axes:
+            action = PRIORITY_ACTION.get(low_axes[0], f"extra-verification({low_axes[0]})")
+        elif v.get("verdict") == "flag":
+            action = "extra-redteam"
+        else:
+            action = "baseline-only"
+        rows.append({"id": c["id"],
+                     "verdict": "kill?(LLM/要確認)" if c.get("_llm_kill") else v.get("verdict", "?"),
+                     "priority_for_next_round": sum(breakdown.values()),
+                     "breakdown": breakdown,
+                     "recommended_next_action": action,
+                     "status": "not_rejected"})     # priority は配分であり棄却ではない(floor)
+    rows.sort(key=lambda r: (-r["priority_for_next_round"], r["id"]))
+    write_json(run, "priority.json", {
+        "_note": ("priority_for_next_round は『次ラウンドの追加計算資源の配分指針』であり、"
+                  "採用/棄却の判定ではない。低 priority でも棄却されず、baseline 検証は全員が受け続ける(floor)。"
+                  "既存 artifact からの決定的計算(LLM 不使用)。"),
+        "floor": "all survivors keep full standing; priority allocates EXTRA compute only",
+        "rows": rows})
+    by_id = {r["id"]: r for r in rows}
+    for c in survivors:
+        c["_priority"] = by_id[c["id"]]["priority_for_next_round"]
+        c["_next_action"] = by_id[c["id"]]["recommended_next_action"]
+    log(run, f"  priority: 追加予算の配分指針を {len(rows)} 件に付与(採用判定ではない / floor 保証)")
+    return rows
+
+
 def arbiter(survivors, run, axes=None):
     """idea段の Arbiter = 整理係。勝者を選ばず matrix を人間に出す。
     評価軸は config の eval_axes 駆動(P0: 以前は4軸ハードコードだった)。"""
@@ -1257,6 +1317,9 @@ def arbiter(survivors, run, axes=None):
             "verdict": status, "risk_type": c.get("risk_type", ""),
             "hypothesis": c.get("hypothesis", ""),
             "cheapest_kill": c.get("cheapest_kill", ""),
+            # 配分指針(#37)。採用判定ではない(凡例参照)
+            "next_round": (f'{c["_priority"]} → {c.get("_next_action", "-")}'
+                           if "_priority" in c else "-"),
         }
         for ax in axes:
             row[ax] = cell(v, ax)
@@ -1269,18 +1332,21 @@ def arbiter(survivors, run, axes=None):
     rows.sort(key=score)
     write_json(run, "decision_matrix.json", rows)
 
-    header = "| id | lens | cluster | engine | verdict | risk | " + " | ".join(axes) + " | cheapest_kill |"
-    sep = "|" + "---|" * (7 + len(axes))
+    header = ("| id | lens | cluster | engine | verdict | risk | " + " | ".join(axes)
+              + " | cheapest_kill | next_round(配分) |")
+    sep = "|" + "---|" * (8 + len(axes))
     md = ["# decision_matrix (人間が読む)\n",
           "**勝者は選んでいない。** AIは候補を出し客観検証しただけ。",
           "どの生存案に *実験予算* を割くかは人間が決める(ARCHITECTURE §3.7 / §5)。\n",
           "verdict 凡例: `keep` / `flag`(通説違反など要注目で残す) / "
           "`kill?(LLM/要確認)`=LLM は kill 推奨だが客観未確認 → 人間が棄却の妥当性を判断。\n",
+          "next_round(配分)凡例: 次ラウンドで**追加**の検証予算をどこに使うかの決定的な指針"
+          "(`priority.json` に内訳)。**採用判定ではない** — 低くても棄却されない(floor / #37)。\n",
           header, sep]
     for r in rows:
         cells = [r["id"], r["lens"], r["cluster"], r["engine"], r["verdict"], r["risk_type"]]
         cells += [r[ax] for ax in axes]
-        cells.append(r["cheapest_kill"])
+        cells += [r["cheapest_kill"], r.get("next_round", "-")]
         md.append("| " + " | ".join(str(x).replace("|", "/").replace("\n", " ") for x in cells) + " |")
     md.append("\n## 各候補の仮説\n")
     for r in rows:
@@ -1396,10 +1462,13 @@ def report(charter, survivors, all_cands, run):
           "6. `verdicts/*.json` … Tier0 検証結果(novelty/soundness/feasibility + prior_art)。",
           "7. `proximity.json` … within-run の重複クラスタ・多様性・未探索軸(#34。注釈のみ)。",
           "8. `hypothesis_graph.{json,md}` … 仮説の lineage(seed→生成→攻撃→改訂→検証 / #35)。",
-          "9. `discarded.md` … hard gate 落ち(理由付き)。 `unresolved.md` … 未解決・未追跡変種。",
+          "9. `priority.json` … 次ラウンドの追加検証予算の配分指針(#37。**採用判定ではない**・内訳付き)。",
+          "10. `discarded.md` … hard gate 落ち(理由付き)。 `unresolved.md` … 未解決・未追跡変種。",
           "",
           "## 次の一手(人間)",
           "- 生存案のうち `cheapest_kill` が安いものから Tier1(toy計算/既存データ再解析)に回す。",
+          "- matrix の `next_round(配分)` / `priority.json` は追加検証の配分指針(採用判定ではない)。"
+          "不確実性の高い軸から潰すのに使う。",
           "- prior_art の source_tier が低い novelty 判定は、権威DB(INSPIRE等)で裏取りする。",
           "- flag(通説違反など)は消さず、面白い線として別途検討。",
           "- `kill?(LLM/要確認)` は LLM の棄却理由が客観的に正しいか人間が確認(誤kill救済)。",
@@ -1472,7 +1541,31 @@ DEFAULT_CFG = {
     "queue_poll_sec": 3, "queue_timeout_sec": 600,
     "session_warmup_sec": 8, "inject_enter_delay_sec": 1.5,
     "session_buffer_max_chunks": 256,   # TUI 出力バッファの保持上限(チャンク数。診断 tail 用)
+    # --- 予算プロファイル(Issue #37)。pairwise は全プロファイル 0 既定(opt-in v2 / #36) ---
+    # rounds / redteam_per_candidate は charter に記録のみ(rounds>1 の実行は #38)。
+    "budget_profile": "",               # "" = 未使用(従来どおり)。quick|normal|deep(--budget で指定)
+    "budget_profiles": {
+        "quick":  {"n_lenses": 3, "rounds": 1, "redteam_per_candidate": 1, "pairwise_matches": 0},
+        "normal": {"n_lenses": 6, "rounds": 1, "redteam_per_candidate": 1, "pairwise_matches": 0},
+        # deep の n_lenses はレンズプール(現状6)に cap される。プールを増やせば自動で広がる
+        "deep":   {"n_lenses": 12, "rounds": 2, "redteam_per_candidate": 2, "pairwise_matches": 0},
+    },
 }
+
+
+def apply_budget_profile(cfg, name):
+    """予算プロファイルを cfg に適用(Issue #37)。v1 で実際に効くのは n_lenses のみ
+    (レンズプール数で cap)。rounds/redteam_per_candidate/pairwise は charter 記録用
+    (multi-round 実行は #38、pairwise は opt-in v2)。明示 CLI(--n-lenses)はこの後で上書きされる。"""
+    profiles = cfg.get("budget_profiles") or {}
+    p = profiles.get(name)
+    if not isinstance(p, dict):
+        raise SystemExit(f"budget profile '{name}' が config に無い(候補: {', '.join(profiles) or '(なし)'})")
+    pool = len(cfg.get("lenses") or [])
+    cfg["n_lenses"] = max(1, min(int(p.get("n_lenses", cfg["n_lenses"])), pool))
+    cfg["_budget"] = {"profile": name, **p,
+                      "_note": "rounds>1 / redteam_per_candidate>1 の実行は未実装(#38)。pairwise は opt-in v2(#36)。"}
+    return cfg
 
 
 def load_cfg(path):
@@ -1499,6 +1592,8 @@ def main():
     ap.add_argument("--constraints", default="", help="制約(使える装置/データ/計算資源 等)")
     ap.add_argument("--config", default=str(ROOT / "config.json"))
     ap.add_argument("--engine", choices=["dual", "codex", "claude", "mock"], help="config を上書き")
+    ap.add_argument("--budget", choices=["quick", "normal", "deep"],
+                    help="予算プロファイル(#37)。n_lenses 等を一括設定(明示 --n-lenses が優先)")
     ap.add_argument("--n-lenses", type=int, help="使う発散レンズ数(config を上書き)")
     ap.add_argument("--no-lit-search", action="store_true",
                     help="文献検索(arXiv/INSPIRE)を無効化(offline/高速テスト用)")
@@ -1512,10 +1607,12 @@ def main():
         ap.error("--seed か --seed-file が必要です")
 
     cfg = load_cfg(args.config)
+    if args.budget or cfg.get("budget_profile"):
+        apply_budget_profile(cfg, args.budget or cfg["budget_profile"])
     if args.engine:
         cfg["engine"] = args.engine
     if args.n_lenses:
-        cfg["n_lenses"] = args.n_lenses
+        cfg["n_lenses"] = args.n_lenses          # 明示 CLI はプロファイルより優先
     if args.no_lit_search:
         cfg["lit_search_enabled"] = False
     if args.engines:
@@ -1566,6 +1663,7 @@ def main():
         cands = verify(runner, cands, cfg, run, mem)
         log(run, "[7/8] HARD GATE— kill を捨て案台帳へ")
         survivors = hard_gate(cands, run)
+        priority_for_next_round(survivors, charter["eval_axes"], run)   # 配分指針(#37)。採用判定ではない
         log(run, "[8/8] ARBITER  — 整理(勝者は選ばない)")
         arbiter(survivors, run, charter["eval_axes"])
         build_hypothesis_graph(cands, run)          # lineage を graph artifact に集約(#35)
