@@ -34,6 +34,9 @@ python orchestrate.py --seed "..." --engine claude          # claude のみ
 
 # ドメインを切り替える(例: 宇宙機研究)
 python orchestrate.py --config configs/spacecraft.json --seed "..."
+
+# 予算プロファイル(#37): quick(3レンズ) / normal(6) / deep(6+将来の複数round)
+python orchestrate.py --budget quick --seed "..."
 ```
 
 出力は `runs/<timestamp>-<slug>/` に出る。まず `REPORT.md` と `decision_matrix.md` を読む。
@@ -51,6 +54,7 @@ runs/<id>/
 ├── verdicts/*.json      # Tier0 検証(novelty/soundness/feasibility + prior_art/evidence_refs)
 ├── proximity.json       # within-run の重複クラスタ・多様性・未探索軸(#34。注釈のみ・棄却しない)
 ├── hypothesis_graph.json# 仮説 lineage(seed→生成→攻撃→改訂→検証 の typed edges / #35)+ .md
+├── priority.json        # 次ラウンドの追加検証予算の配分指針(#37。採用判定ではない・breakdown付き)
 ├── discarded.md         # 客観 hard gate 落ちのみ(形不備など。理由付き・消さない)
 ├── unresolved.md        # 未解決論点 + 未追跡の stronger_variant
 └── log/                 # 各LLM呼び出しの生ログ(provenance)
@@ -93,6 +97,19 @@ python orchestrate.py --engine mock --no-lit-search --seed "queue test"
   `--no-lit-search` で一括無効化(offline/高速テスト用)。
 - **検証ゲートの方針**: 自動 reject は**客観基準(形不備など)のみ**。LLM の `kill` は推奨扱いで落とさず、
   `decision_matrix` に `kill?(LLM/要確認)` として残す(誤kill救済 / ARCHITECTURE §3.6)。
+- `budget_profile` / `budget_profiles`: 予算プロファイル(`--budget quick|normal|deep`)。v1 で効くのは
+  `n_lenses`(レンズプール数で cap)。`rounds`/`redteam_per_candidate` は charter 記録のみ(実行は #38)、
+  `pairwise_matches` は全プロファイル 0 既定(AI debate は opt-in v2 / #36)。
+
+## 次ラウンド配分(priority / Issue #37)
+hard gate 後、生存案ごとに **`priority_for_next_round`**(次の**追加**検証予算の配分指針)を
+**既存 artifact から決定的に計算**する(LLM 不使用)。入力は軸 confidence(low/medium)・unknowns 数・
+flag・LLM-kill(棄却理由の人間確認作業)・クラスタ非代表(−)・過去 run 重複(−)で、内訳ごと `priority.json` に残す。
+
+- **採用判定ではない**(ranking ではなく allocation)。decision_matrix の並びも従来どおり verdict 基準のまま。
+- **floor 保証**: 低 priority でも棄却されず、baseline 検証は全員が受け続ける(de-facto kill の防止)。
+- `recommended_next_action` は最も不確実な軸への決定的マッピング(novelty→deeper-lit-search、
+  feasibility→toy-computation 等)。matrix の `next_round(配分)` 列にも併記。
 
 ## ドメイン設定(domain config / Issue #40)
 既定(`config.json`)は HEP/加速器向け。**workflow は変えず**、config だけでドメインを差し替える:
