@@ -117,6 +117,13 @@
 > ベンダー多様性(Claude vs Codex)より、**戦略多様性(レンズの違い)**の方が候補の質に効く。
 > 「単一モデル+複数戦略プロンプト」でも多様性は出る。ベンダー混在の追加価値は §11 の H2 で検証する。
 
+### 3.3b PROXIMITY（within-run 重複検知・多様性 / Issue #34）
+- **責務:** GENERATE 直後に候補集合を俯瞰し、同型(言い換え)クラスタ・多様性警告・未探索軸を**注釈**する(Co-Scientist の Proximity 相当)。
+- **機構:** クラスタ所属は**決定的**(char-bigram Jaccard + union-find)。LLM は theme / diversity_warning / underexplored_axes の**ラベル付けのみ**(所属を変更しない。失敗しても決定的注釈は残る)。
+- **出力:** `proximity.json`、各候補に `_cluster_id`、decision_matrix の cluster 列、REPORT の多様性セクション。
+- **禁止:** **これを理由に棄却しない**(全メンバーが red-team / verify を受ける)。representative は表示・整理用であり、予算配分に使うのは #37 の責務。cross-run 重複検知(memory/seen)とは別物。
+- **lineage(Issue #35):** 各候補は `_lineage`(hypothesis_id / generation_round / parents / operator / cluster_id / 自己申告の changes・resolved_red_team_issues)を持ち、run 終端で `hypothesis_graph.{json,md}`(seed→生成→攻撃→改訂→検証の typed edges)に決定的に集約される。**graph は data model であり、実行は linear pipeline のまま**(scheduler の導入判断は Issue #42)。
+
 ### 3.4 RED-TEAM（cross-review を付け替えたもの）
 - **責務:** 他 worker の案を **攻撃して鋭くする**。隠れ前提、交絡、反例、feasibility 穴、強い隣接変種を出す。
 - **入力:** 候補成果物(著者は伏せる=blind が望ましい)。

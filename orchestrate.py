@@ -80,10 +80,26 @@ HYPOTHESIS_SCHEMA = _obj(
         "failure_condition":   {"type": "string"},
         # 文献検索用の英語キーワード(契約本文が日本語でも evidence 検索を効かせる)
         "search_keywords":     {"type": "array", "items": {"type": "string"}},
+        # 任意(revise の自己申告 lineage / Issue #35。orchestrator が _lineage へ移す)
+        "changes":                  {"type": "array", "items": {"type": "string"}},
+        "resolved_red_team_issues": {"type": "array", "items": {"type": "string"}},
     },
     ["id", "question", "hypothesis", "novelty_claim", "soundness", "falsification",
      "test_method", "feasibility", "significance_if_true", "risk_type",
      "cheapest_kill", "assumptions", "unknowns"],
+)
+
+# Proximity(Issue #34): クラスタ所属は決定的に確定済み。LLM はラベルのみ返す。
+PROXIMITY_SCHEMA = _obj(
+    {
+        "clusters": {"type": "array", "items": _obj(
+            {"cluster_id":        {"type": "string"},
+             "theme":             {"type": "string"},
+             "diversity_warning": {"type": "string"}},
+            ["cluster_id", "theme", "diversity_warning"])},
+        "underexplored_axes": {"type": "array", "items": {"type": "string"}},
+    },
+    ["clusters", "underexplored_axes"],
 )
 
 REVIEW_SCHEMA = _obj(
@@ -346,6 +362,11 @@ class MockRunner:
                 "cheapest_kill": "既存データ D の1点チェックで反証可能。",
                 "assumptions": ["前提A（mock）"], "unknowns": ["未知1（mock）"],
             }
+        if kind == "proximity":
+            return {"clusters": [{"cluster_id": "C1", "theme": "mock theme（残差学習）",
+                                  "diversity_warning": "表現違いの同型（mock）"}],
+                    "underexplored_axes": ["negative-control design（mock）",
+                                           "toy-simulation-first（mock）"]}
         if kind == "review":
             return {"attacks": [
                 {"type": "hidden_assumption", "claim": "前提Bが未明示（mock）。",
@@ -660,6 +681,11 @@ def generate(runner, charter, cfg, run, mem):
         data["id"] = f"rq-{i:02d}"
         data["_lens"] = lens
         data["_engine"] = used
+        # lineage(Issue #35)。アンダースコア内部キー = blind red-team プロンプトにリークしない
+        data["_lineage"] = {"hypothesis_id": data["id"], "generation_round": 0, "parents": [],
+                            "operator": "generate",
+                            "changes": data.pop("changes", None) or [],
+                            "resolved_red_team_issues": data.pop("resolved_red_team_issues", None) or []}
         data["provenance"] = provenance(run, cfg, "generate", used_label, lens=lens, engine=used)
         return data
 
@@ -675,6 +701,91 @@ def generate(runner, charter, cfg, run, mem):
     breakdown = ", ".join(f"{k}:{v}" for k, v in sorted(by_eng.items()))
     log(run, f"  生成: {len(cands)}/{len(lenses)} 候補 ({breakdown})" +
         (f" / 過去と類似 {ndup}件(重複注意)" if ndup else ""))
+    return cands
+
+
+def proximity(runner, cands, charter, cfg, run):
+    """within-run の重複検知・多様性確認(Issue #34 / Co-Scientist の Proximity 相当)。
+    **注釈のみ** — これを理由に棄却しない。全メンバーが後段の red-team / verify を受ける。
+    クラスタ所属は決定的(char-bigram Jaccard + union-find)。LLM はラベル付けのみ
+    (theme / diversity_warning / underexplored_axes)で、失敗しても決定的注釈は残る。"""
+    if not cfg.get("proximity_enabled", True) or not cands:
+        return cands
+    thr = float(cfg.get("proximity_sim_threshold", 0.45))
+    ids = [c["id"] for c in cands]
+    by_id = {c["id"]: c for c in cands}
+    texts = {i: by_id[i].get("question", "") + by_id[i].get("hypothesis", "") for i in ids}
+
+    parent = {i: i for i in ids}
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    pair_sim = {}
+    for a_i, a in enumerate(ids):
+        for b in ids[a_i + 1:]:
+            s = _similarity(texts[a], texts[b])
+            pair_sim[f"{a}|{b}"] = round(s, 2)
+            if s >= thr:
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[max(ra, rb)] = min(ra, rb)
+
+    groups = {}
+    for i in ids:
+        groups.setdefault(find(i), []).append(i)
+
+    def completeness(c):   # representative は契約の充足度で決定的に選ぶ(同点は id 順)
+        return sum(1 for k in ("baseline", "success_metric", "failure_condition", "search_keywords")
+                   if c.get(k))
+
+    clusters = []
+    for n, root in enumerate(sorted(groups), 1):
+        members = sorted(groups[root])
+        rep = sorted(members, key=lambda m: (-completeness(by_id[m]), m))[0]
+        clusters.append({"cluster_id": f"C{n}", "theme": "", "members": members,
+                         "representative": rep, "diversity_warning": ""})
+
+    data = {"method": f"char-bigram jaccard >= {thr}(union-find)。LLM はラベルのみ・所属は変更しない",
+            "clusters": clusters, "underexplored_axes": [], "pair_similarity": pair_sim}
+
+    if cfg.get("proximity_llm_enabled", True):
+        label = f"{run['id']}__proximity"
+        shown = [{"id": c["id"], "lens": c.get("_lens", ""), "question": c.get("question", ""),
+                  "hypothesis": c.get("hypothesis", "")} for c in cands]
+        fixed = [{k: cl[k] for k in ("cluster_id", "members", "representative")} for cl in clusters]
+        prompt = render(load_prompt("proximity"),
+                        seed=charter["seed"], lenses=", ".join(charter["lenses"]),
+                        candidates=json.dumps(shown, ensure_ascii=False, indent=2),
+                        clusters=json.dumps(fixed, ensure_ascii=False, indent=2),
+                        schema=json.dumps(PROXIMITY_SCHEMA, ensure_ascii=False))
+        try:
+            res = runner.run(prompt, PROXIMITY_SCHEMA, "proximity", label, run["log"])
+            lbl = {x.get("cluster_id"): x for x in res.get("clusters", [])}
+            for cl in clusters:
+                if cl["cluster_id"] in lbl:
+                    cl["theme"] = lbl[cl["cluster_id"]].get("theme", "")
+                    cl["diversity_warning"] = lbl[cl["cluster_id"]].get("diversity_warning", "")
+            data["underexplored_axes"] = res.get("underexplored_axes", [])
+            data["provenance"] = provenance(run, cfg, "proximity", label)
+        except Exception as e:
+            log(run, f"  [proximity] ラベル付け失敗(決定的クラスタのみ残す): {e}")
+
+    for cl in clusters:
+        for m in cl["members"]:
+            by_id[m]["_cluster_id"] = cl["cluster_id"]
+            if len(cl["members"]) > 1 and m != cl["representative"]:
+                by_id[m]["_cluster_rep"] = cl["representative"]
+            lin = by_id[m].get("_lineage")
+            if lin is not None:
+                lin["cluster_id"] = cl["cluster_id"]
+    write_json(run, "proximity.json", data)
+    run["proximity"] = data
+    nmulti = sum(1 for cl in clusters if len(cl["members"]) > 1)
+    warn = sum(1 for cl in clusters if cl.get("diversity_warning"))
+    log(run, f"  proximity: {len(cands)}候補 → {len(clusters)}クラスタ(複数員 {nmulti} / 同型警告 {warn})。注釈のみ・棄却しない")
     return cands
 
 
@@ -738,13 +849,21 @@ def revise(runner, cands, cfg, run):
             data["_engine"] = c.get("_engine", "?")   # 生成 engine の印を改訂後にも引き継ぐ
             data["_review"] = c.get("_review", {"attacks": []})
             data["_verify_todo"] = c.get("_verify_todo", [])
-            if c.get("_near_dup"):
-                data["_near_dup"] = c["_near_dup"]   # 重複検知の印を改訂後にも引き継ぐ
+            for k in ("_near_dup", "_cluster_id", "_cluster_rep"):
+                if c.get(k):
+                    data[k] = c[k]                    # 重複検知/クラスタの印を改訂後にも引き継ぐ
+            # lineage(Issue #35)。changes/resolved は LLM の自己申告(検証済み事実ではない)
+            data["_lineage"] = {"hypothesis_id": c["id"], "generation_round": 0,
+                                "parents": [c["id"]], "operator": "revise", "self_reported": True,
+                                "cluster_id": c.get("_cluster_id", ""),
+                                "changes": data.pop("changes", None) or [],
+                                "resolved_red_team_issues": data.pop("resolved_red_team_issues", None) or []}
             data["provenance"] = provenance(run, cfg, "revise", label,
                                             lens=c.get("_lens", "?"), revised_from=c["id"])
             return data
         except Exception as e:
             log(run, f"  [revise {c['id']}] FAILED: {e} / 原案を継続")
+            c["_lineage"] = {**c.get("_lineage", {}), "operator": "revise_failed", "parents": [c["id"]]}
             return c
 
     revised = _parallel(cfg, [(one, (c,)) for c in cands])
@@ -1085,7 +1204,8 @@ def arbiter(survivors, run, axes=None):
         v = c.get("_verdict", {})
         status = "kill?(LLM/要確認)" if c.get("_llm_kill") else v.get("verdict", "?")
         row = {
-            "id": c["id"], "lens": c.get("_lens", "?"), "engine": c.get("_engine", "?"),
+            "id": c["id"], "lens": c.get("_lens", "?"), "cluster": c.get("_cluster_id", "-"),
+            "engine": c.get("_engine", "?"),
             "verdict": status, "risk_type": c.get("risk_type", ""),
             "hypothesis": c.get("hypothesis", ""),
             "cheapest_kill": c.get("cheapest_kill", ""),
@@ -1101,8 +1221,8 @@ def arbiter(survivors, run, axes=None):
     rows.sort(key=score)
     write_json(run, "decision_matrix.json", rows)
 
-    header = "| id | lens | engine | verdict | risk | " + " | ".join(axes) + " | cheapest_kill |"
-    sep = "|" + "---|" * (6 + len(axes))
+    header = "| id | lens | cluster | engine | verdict | risk | " + " | ".join(axes) + " | cheapest_kill |"
+    sep = "|" + "---|" * (7 + len(axes))
     md = ["# decision_matrix (人間が読む)\n",
           "**勝者は選んでいない。** AIは候補を出し客観検証しただけ。",
           "どの生存案に *実験予算* を割くかは人間が決める(ARCHITECTURE §3.7 / §5)。\n",
@@ -1110,7 +1230,7 @@ def arbiter(survivors, run, axes=None):
           "`kill?(LLM/要確認)`=LLM は kill 推奨だが客観未確認 → 人間が棄却の妥当性を判断。\n",
           header, sep]
     for r in rows:
-        cells = [r["id"], r["lens"], r["engine"], r["verdict"], r["risk_type"]]
+        cells = [r["id"], r["lens"], r["cluster"], r["engine"], r["verdict"], r["risk_type"]]
         cells += [r[ax] for ax in axes]
         cells.append(r["cheapest_kill"])
         md.append("| " + " | ".join(str(x).replace("|", "/").replace("\n", " ") for x in cells) + " |")
@@ -1119,6 +1239,65 @@ def arbiter(survivors, run, axes=None):
         md.append(f"- **{r['id']}** ({r['lens']}): {r['hypothesis']}")
     write_text(run, "decision_matrix.md", "\n".join(md))
     return rows
+
+
+def build_hypothesis_graph(cands, run):
+    """lineage を node/edge に集約(決定的・LLM 不使用 / Issue #35)。
+    node は artifact 版: rq-NN.v0 = candidates/(原案)、rq-NN.v1 = revised/(改訂)。
+    将来の evolution は .v2 / 新 id + parents で同じ規約に乗る。"""
+    nodes = [{"id": "seed", "type": "seed"}]
+    edges = []
+    for c in cands:
+        cid = c["id"]
+        lin = c.get("_lineage", {})
+        v = c.get("_verdict", {}) or {}
+        status = ("discarded(form)" if v.get("_form_fail")
+                  else "kill?(LLM/要確認)" if c.get("_llm_kill") else v.get("verdict", "?"))
+        nodes.append({"id": f"{cid}.v0", "hypothesis_id": cid, "stage": "generate",
+                      "operator": "generate", "generation_round": 0,
+                      "lens": c.get("_lens", ""), "engine": c.get("_engine", ""),
+                      "cluster_id": c.get("_cluster_id", ""),
+                      "artifact": f"candidates/{cid}.json"})
+        edges.append({"type": "generated_from", "from": f"{cid}.v0", "to": "seed"})
+        edges.append({"type": "attacked_by", "from": f"{cid}.v0", "to": f"reviews/{cid}.json"})
+        nodes.append({"id": f"{cid}.v1", "hypothesis_id": cid, "stage": "revise",
+                      "operator": lin.get("operator", "revise"),
+                      "generation_round": lin.get("generation_round", 0),
+                      "status": status,
+                      "changes": lin.get("changes", []),
+                      "resolved_red_team_issues": lin.get("resolved_red_team_issues", []),
+                      "self_reported": lin.get("self_reported", False),
+                      "artifact": f"revised/{cid}.json"})
+        edges.append({"type": "revised_from", "from": f"{cid}.v1", "to": f"{cid}.v0"})
+        edges.append({"type": "verified_by", "from": f"{cid}.v1", "to": f"verdicts/{cid}.json"})
+        if c.get("_near_dup"):
+            edges.append({"type": "past_duplicate_of", "from": f"{cid}.v0",
+                          "to": f"{c['_near_dup']['run']}/{c['_near_dup']['id']}",
+                          "score": c["_near_dup"]["score"]})
+    for cl in (run.get("proximity") or {}).get("clusters", []):
+        ms = cl.get("members", [])
+        for i, a in enumerate(ms):
+            for b in ms[i + 1:]:
+                edges.append({"type": "near_duplicate_of", "from": f"{a}.v0", "to": f"{b}.v0",
+                              "cluster_id": cl["cluster_id"]})
+    write_json(run, "hypothesis_graph.json", {"nodes": nodes, "edges": edges})
+
+    md = ["# hypothesis graph (lineage / 人間が読む)\n",
+          "各仮説が seed → 生成 → red-team 攻撃 → 改訂 → 検証 とどう育ったか。"
+          "`resolved` は revise 時の **LLM 自己申告**(検証済み事実ではない)。\n"]
+    for c in cands:
+        cid = c["id"]
+        lin = c.get("_lineage", {})
+        v = c.get("_verdict", {}) or {}
+        status = ("discarded(form)" if v.get("_form_fail")
+                  else "kill?(LLM/要確認)" if c.get("_llm_kill") else v.get("verdict", "?"))
+        n_att = len((c.get("_review") or {}).get("attacks", []))
+        res = lin.get("resolved_red_team_issues", [])
+        md.append(f"- **{cid}** [{c.get('_lens','?')} / {c.get('_engine','?')} / "
+                  f"cluster {c.get('_cluster_id','-')}] "
+                  f"seed → v0 → 攻撃{n_att}件 → {lin.get('operator','revise')} → v1 → **{status}**"
+                  + (f" / resolved(自己申告): {', '.join(res[:4])}" if res else ""))
+    write_text(run, "hypothesis_graph.md", "\n".join(md))
 
 
 def write_unresolved(cands, run):
@@ -1152,6 +1331,14 @@ def report(charter, survivors, all_cands, run):
              *[f"- {c['id']}: 過去 {c['_near_dup']['run']}/{c['_near_dup']['id']} と類似 "
                f"(bigram {c['_near_dup']['score']})" for c in all_cands if c.get('_near_dup')], ""]
             if any(c.get('_near_dup') for c in all_cands) else []),
+          *(["## 多様性(within-run proximity / 注釈のみ・棄却しない)",
+             *[f"- {cl['cluster_id']}『{cl.get('theme') or '-'}』: {', '.join(cl['members'])}"
+               + (f" / 代表 {cl['representative']}" if len(cl['members']) > 1 else "")
+               + (f" / ⚠ {cl['diversity_warning']}" if cl.get('diversity_warning') else "")
+               for cl in run.get("proximity", {}).get("clusters", [])],
+             *([f"- 未探索軸(次 run の種候補): {', '.join(run['proximity']['underexplored_axes'])}"]
+               if run.get("proximity", {}).get("underexplored_axes") else []), ""]
+            if run.get("proximity") else []),
           "## 読み方",
           "1. `decision_matrix.md` … 生存候補を評価軸ごとに(単一スコアに潰さず)一覧。",
           "2. `candidates/*.json` … 各 Research Hypothesis Contract。",
@@ -1159,7 +1346,9 @@ def report(charter, survivors, all_cands, run):
           "4. `revised/*.json` … red-team 後の改訂版。原案は `candidates/` に残る。",
           "5. `evidence/*.json` … arXiv(preprint)/INSPIRE-HEP/NASA NTRS(権威DB)から機械的に収集した検証補助データ。",
           "6. `verdicts/*.json` … Tier0 検証結果(novelty/soundness/feasibility + prior_art)。",
-          "7. `discarded.md` … hard gate 落ち(理由付き)。 `unresolved.md` … 未解決・未追跡変種。",
+          "7. `proximity.json` … within-run の重複クラスタ・多様性・未探索軸(#34。注釈のみ)。",
+          "8. `hypothesis_graph.{json,md}` … 仮説の lineage(seed→生成→攻撃→改訂→検証 / #35)。",
+          "9. `discarded.md` … hard gate 落ち(理由付き)。 `unresolved.md` … 未解決・未追跡変種。",
           "",
           "## 次の一手(人間)",
           "- 生存案のうち `cheapest_kill` が安いものから Tier1(toy計算/既存データ再解析)に回す。",
@@ -1225,6 +1414,9 @@ DEFAULT_CFG = {
     "service_tier": "flex", "concurrency": 4, "n_lenses": 4, "timeout_sec": 420,
     "lenses": ["analogy", "anomaly", "method-driven", "contrarian", "gap", "combination"],
     "eval_axes": ["novelty", "soundness", "feasibility", "significance"],
+    "proximity_enabled": True,        # within-run 重複検知・多様性(#34。注釈のみ)
+    "proximity_llm_enabled": True,    # クラスタの theme/警告/未探索軸ラベル(失敗しても決定的注釈は残る)
+    "proximity_sim_threshold": 0.45,  # char-bigram Jaccard のクラスタ閾値(cross-run 検知は 0.5)
     "lit_search_enabled": True, "lit_search_max_terms": 6,
     "lit_search_max_results": 5, "lit_search_timeout_sec": 15,
     "inspire_enabled": True,   # inspire_mode(always|trigger|off)未指定時はここから導出
@@ -1291,7 +1483,7 @@ def main():
     print(f"memory: 既出候補 {len(mem['seen'])} / 決定 {len(mem['decisions'])} / "
           f"好み {'有' if mem['preferences'] else '無'}\n")
 
-    log(run, "[1/7] PLANNER  — charter 固定")
+    log(run, "[1/8] PLANNER  — charter 固定")
     charter = planner(seed, args.constraints, cfg, run)
     # 使える engine(実行ファイルが解決できるもの。mock は常に可)を確定。
     # セッションは orchestrator が pywinpty で spawn・駆動する(手動 worker 不要)。
@@ -1307,21 +1499,24 @@ def main():
     runner = make_runner_for(live[0], cfg)   # primary。セッションは初回 job で spawn される
 
     try:
-        log(run, "[2/7] GENERATE — 発散(独立・並列・memory反映)")
+        log(run, "[2/8] GENERATE — 発散(独立・並列・memory反映)")
         cands = generate(runner, charter, cfg, run, mem)
         if not cands:
             print("候補が0件。engine/認証/timeout を確認(--engine mock で配管だけ検証可)。")
             sys.exit(1)
-        log(run, "[3/7] RED-TEAM — 攻撃 -> 検証項目へ変換")
+        log(run, "[3/8] PROXIMITY— within-run 重複検知・多様性(注釈のみ・棄却しない)")
+        cands = proximity(runner, cands, charter, cfg, run)
+        log(run, "[4/8] RED-TEAM — 攻撃 -> 検証項目へ変換")
         cands = redteam(runner, cands, cfg, run)
-        log(run, "[4/7] REVISE   — 攻撃を受けて仮説を1回だけ改訂")
+        log(run, "[5/8] REVISE   — 攻撃を受けて仮説を1回だけ改訂")
         cands = revise(runner, cands, cfg, run)
-        log(run, "[5/7] VERIFY   — Tier0(形/文献/soundness/feasibility)")
+        log(run, "[6/8] VERIFY   — Tier0(形/文献/soundness/feasibility)")
         cands = verify(runner, cands, cfg, run, mem)
-        log(run, "[6/7] HARD GATE— kill を捨て案台帳へ")
+        log(run, "[7/8] HARD GATE— kill を捨て案台帳へ")
         survivors = hard_gate(cands, run)
-        log(run, "[7/7] ARBITER  — 整理(勝者は選ばない)")
+        log(run, "[8/8] ARBITER  — 整理(勝者は選ばない)")
         arbiter(survivors, run, charter["eval_axes"])
+        build_hypothesis_graph(cands, run)          # lineage を graph artifact に集約(#35)
         write_unresolved(cands, run)
         report(charter, survivors, cands, run)
         append_seen(run, cands)                     # 自動メモリ(重複検知用)に追記
