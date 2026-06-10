@@ -1,0 +1,3 @@
+# orchestrator 本体は標準ライブラリのみで動く。
+# 対話セッション駆動(ADR-001: InteractiveSessionRunner / ConPTY)に pywinpty を使う(Windows 専用)。
+pywinpty>=3.0 ; sys_platform == "win32"
