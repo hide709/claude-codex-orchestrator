@@ -56,6 +56,7 @@ runs/<id>/
 ├── proximity.json       # within-run の重複クラスタ・多様性・未探索軸(#34。注釈のみ・棄却しない)
 ├── hypothesis_graph.json# 仮説 lineage(seed→生成→攻撃→改訂→検証 の typed edges / #35)+ .md
 ├── priority.json        # 次ラウンドの追加検証予算の配分指針(#37。採用判定ではない・breakdown付き)
+├── memory_suggestions.md# memory に記録すべき候補の自動提案(#48。保存しない・コマンド実行=承認)+ .json
 ├── discarded.md         # 客観 hard gate 落ちのみ(形不備など。理由付き・消さない)
 ├── unresolved.md        # 未解決論点 + 未追跡の stronger_variant
 └── log/                 # 各LLM呼び出しの生ログ(provenance)
@@ -141,6 +142,9 @@ python orchestrate.py prefer  "高novelty優先 / ビームダイナミクス系
 - `memory/decisions.jsonl`(commit)= 採用/却下、`memory/preferences.md`(commit)= 好み、
   `memory/seen.jsonl`(gitignore)= 重複検知用の自動キャッシュ。
 - 効き方: 却下済みは**再提案しない** / 好みに寄せる / 既出と重複する候補は `REPORT.md` で印(**検知のみ・棄却しない**)。
+- **記録候補の自動提案(#48)**: run 終了時に `memory_suggestions.md` へ「記録すべきこと」
+  (kill?(LLM) の reject 候補 / 生存案の採否 / 重複反復時の方針 / 未探索軸)を**コピペ可能なコマンド付き**で提案。
+  **自動では保存されない** — コマンドの実行が承認(放置=却下)。
 - 原則は ARCHITECTURE §0(AI判断で自動棄却しない)。詳細は `memory/README.md`。
 
 ## このMVPでまだやっていないこと(ARCHITECTURE §12)
