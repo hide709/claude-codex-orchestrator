@@ -142,7 +142,7 @@ AXIS_LABEL = {
     "novelty":            "新しさ(novelty)",
     "soundness":          "筋の良さ(soundness)",
     "feasibility":        "実行しやすさ(feasibility)",
-    "significance":       "インパクト(significance)",
+    "significance":       "impact / インパクト(significance)",
     "mechanism_clarity":  "機構の明確さ(mechanism_clarity)",
     "validation_clarity": "検証の明確さ(validation_clarity)",
     "baseline_clarity":   "基準比較の明確さ(baseline_clarity)",
@@ -1474,7 +1474,11 @@ def _read_evidence_files(run, cid):
 
 
 def _provider_status(prov, d):
-    """collector artifact から決定的に言える実施状況だけを文にする。"""
+    """collector artifact から決定的に言える実施状況だけを文にする。
+    no_ascii_search_terms は collector の決定的状態(検索語が作れず未実施)であり、
+    HTTP/例外の『エラー』とは区別して表示する(内部コードを露出させない)。"""
+    if d.get("error") == "no_ascii_search_terms":
+        return "未実施(検索語を抽出できず)"
     if d.get("error"):
         return f"エラー({_md_cell(d['error'], 60)})"
     if not d.get("enabled", False):
@@ -1500,6 +1504,8 @@ def write_candidate_reports(charter, cands, run, cfg):
 
     def weakest(c):
         v = c.get("_verdict", {}) or {}
+        if v.get("_form_fail"):   # 客観棄却の主要情報なので一覧にも理由を出す
+            return f"形式不備: {_md_cell(v.get('kill_reason',''), 80)}"
         if c.get("_llm_kill"):
             return f"LLM が棄却を推奨: {_md_cell(c.get('_llm_kill_reason',''), 80)}"
         low = [lab[ax] for ax in axes if (v.get(ax) or {}).get("confidence") == "low"]
@@ -1511,11 +1517,11 @@ def write_candidate_reports(charter, cands, run, cfg):
           "| 項目 | 内容 |", "|---|---|",
           f"| seed | {_md_cell(charter['seed'])} |",
           f"| constraints | {_md_cell(charter.get('constraints') or '(なし)')} |",
-          *( [f"| domain | {charter['domain']} |"] if charter.get("domain") else [] ),
-          f"| engines | {', '.join(charter.get('engines', []))} |",
+          *( [f"| domain | {_md_cell(charter['domain'])} |"] if charter.get("domain") else [] ),
+          f"| engines | {_md_cell(', '.join(charter.get('engines', [])))} |",
           f"| 文献・出典検索 | {'有効' if charter.get('lit_search_enabled', True) else '無効(--no-lit-search)'} |",
-          f"| 予算プロファイル | {charter.get('budget', {}).get('profile', '(none)')} |",
-          f"| 生成時刻 | {charter.get('created','')} |",
+          f"| 予算プロファイル | {_md_cell(charter.get('budget', {}).get('profile', '(none)'))} |",
+          f"| 生成時刻 | {_md_cell(charter.get('created', ''))} |",
           "",
           "## このレポートの読み方",
           "- 正本は JSON artifact(`candidates/` `reviews/` `revised/` `verdicts/` `evidence/` "
@@ -1612,7 +1618,9 @@ def write_candidate_reports(charter, cands, run, cfg):
             md.append("(なし)")
         unproven = []
         if not pa:
-            unproven.append("新しさの主張(novelty_claim)— 文献ヒット無し/検索無効のため**未検証**")
+            # 空の理由は断定できない(ヒット不採用/検索無効/ヒット無し のいずれもありうる)
+            unproven.append("新しさの主張(novelty_claim)— verifier が採用した近い先行研究が無く"
+                            "**未検証(要確認)**(検索の実施状況は上表、生データは evidence/*.json)")
         unproven.append("実行しやすさ(feasibility)— 机上評価のみ(計算未実施)")
         md += ["", "**根拠がまだ無い主張**: " + " / ".join(unproven),
                "", "### 7. 次の一手",
