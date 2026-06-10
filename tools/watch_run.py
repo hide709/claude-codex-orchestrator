@@ -22,6 +22,22 @@ def latest_run():
     return runs[0] if runs else None
 
 
+def _tail_lines(p, n=8, chunk=16384):
+    """末尾 chunk バイトだけ読んで最後の n 行を返す(長い run でも全文読みしない)。"""
+    try:
+        with open(p, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - chunk))
+            data = f.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    lines = data.splitlines()
+    if size > chunk and lines:
+        lines = lines[1:]      # 途中から読んだ欠け行を捨てる
+    return lines[-n:]
+
+
 def show(rd):
     print(f"\n=== {rd.name} @ {time.strftime('%H:%M:%S')} ===")
     st_p = rd / "status.json"
@@ -40,7 +56,7 @@ def show(rd):
     ev_p = rd / "events.jsonl"
     if ev_p.exists():
         print("--- 直近イベント ---")
-        for line in ev_p.read_text(encoding="utf-8").splitlines()[-8:]:
+        for line in _tail_lines(ev_p, 8):
             try:
                 e = json.loads(line)
                 extra = {k: v for k, v in e.items() if k not in ("ts", "engine", "label", "event")}

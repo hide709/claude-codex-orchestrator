@@ -392,6 +392,7 @@ class InteractiveSessionRunner:
                 ensure_ascii=False, indent=2), encoding="utf-8")
             tmp_f.replace(inbox_f)
             directive = self._directive(label)
+            job_t0 = time.time()   # job 単位の出力基準。前 job の出力時刻を引きずって active 誤判定しない
             if self.proc is None:
                 self._spawn(directive)                  # 最初の job は seed prompt として起動時に渡す
             else:
@@ -400,6 +401,11 @@ class InteractiveSessionRunner:
                 self.proc.write("\r")
             _emit(self.engine, label, "directive_sent", kind=kind)
             started = _now()
+            # 注入直後の現在状態も status に一度反映(watcher が job 開始を見られるように)
+            _wd_status(self.engine, state="directive_sent", label=label, kind=kind,
+                       started_at=started, bytes_total=self.bytes_total,
+                       last_output_age_sec=None, report_tmp_age_sec=None,
+                       proc_alive=(self.proc.isalive() if self.proc is not None else False), hint="")
             waited = 0
             tmp_seen_ts = None
             stale_emitted = invalid_emitted = False
@@ -407,7 +413,8 @@ class InteractiveSessionRunner:
                 # --- watchdog(#46): 現在状態を status.json に反映(遷移は events.jsonl へ) ---
                 with self._blk:
                     btot, lots = self.bytes_total, self.last_output_ts
-                out_age = (time.time() - lots) if lots else None
+                eff = lots if (lots and lots >= job_t0) else None   # この job 開始以降の出力のみ見る
+                out_age = (time.time() - eff) if eff else None
                 state = "active" if (out_age is not None and out_age <= 2 * self.poll) else "idle_waiting_report"
                 if report_tmp.exists():
                     if tmp_seen_ts is None:
@@ -450,9 +457,11 @@ class InteractiveSessionRunner:
                     raise RunnerError(f"{self.engine} session が終了(report 未生成) label={label}")
                 time.sleep(self.poll)
                 waited += self.poll
-            # timeout: 直前まで出力が増えていたか(脱線/長考)/ 完全に沈黙か(こけた)を区別(#46)
-            tstate = ("timeout_active" if (self.last_output_ts and
-                                           time.time() - self.last_output_ts <= 2 * self.poll)
+            # timeout: 直前まで出力が増えていたか(脱線/長考)/ 完全に沈黙か(こけた)を区別(#46)。
+            # この job 開始以降の出力だけを見る(前 job の出力で active 誤判定しない)
+            last = self.last_output_ts
+            tstate = ("timeout_active" if (last and last >= job_t0 and
+                                           time.time() - last <= 2 * self.poll)
                       else "timeout_idle")
             self._dump(logdir, label, f"timeout {self.timeout}s ({tstate})")
             # parse できない report が残っていれば log/<label>.invalid-report.txt に退避してから掃除
@@ -503,6 +512,7 @@ class MockRunner:
         m = re.search(r"(?:rq-|gen_)(\d+)", label) or re.search(r"(\d+)", label)
         idx = int(m.group(1)) if m else 0
         _emit("mock", label, "parsed_and_cleaned")
+        _wd_status("mock", state="idle_done", label="-", kind="-", proc_alive=True)   # 完了後を active のまま残さない
         if kind == "hypothesis":
             lens = label.split("__")[-1]
             return {

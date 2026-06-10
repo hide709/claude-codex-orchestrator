@@ -67,8 +67,10 @@ LLM セッションがこけた・承認待ち・脱線 をリアルタイムに
 ```powershell
 python tools/watch_run.py            # 最新 run の engine 状態を 3 秒間隔で表示(--once で1回)
 ```
-- `STATE`: starting / directive_sent / **active**(出力増加中)/ idle_waiting_report / report_tmp_stale /
-  proc_dead / **timeout_idle**(沈黙のまま timeout)/ **timeout_active**(出力は続いたが report が出ず timeout)
+- `STATE`: starting / directive_sent(job 注入直後)/ **active**(この job の出力が増加中)/
+  idle_waiting_report / report_tmp_stale / **idle_done**(job 完了・次の注入待ち)/ proc_dead /
+  **timeout_idle**(沈黙のまま timeout)/ **timeout_active**(出力は続いたが report が出ず timeout)。
+  active/idle 判定は **job 単位**(前 job の出力時刻を引きずらない)
 - `HINT`: 承認/ログイン待ちらしき文言のヒューリスティック検出(参考情報。state には昇格させない)
 - 異常時は `log/<label>.session.txt` に直近のセッション出力が自動保存される
 - watchdog は**可視化・診断のみ** — LLM の生出力を採用判断には使わない
