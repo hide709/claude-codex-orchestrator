@@ -1653,10 +1653,20 @@ def write_candidate_reports(charter, cands, run, cfg):
     log(run, f"  candidate_reports.md: {len(cands)} 候補の詳細・評価・出典を出力(#47)")
 
 
-# secrets 様文字列の除外(Issue #48)。提案テキストに混入したら塗りつぶす
+# secrets 様文字列の除外(Issue #48)。提案テキストに混入したら塗りつぶす。
+# bearer/authorization は token 本体まで含めて消す(「Bearer xxx」の xxx 残りを防ぐ)
 _SECRET_RE = re.compile(
-    r"(?i)\b(api[_-]?key|secret|token|password|bearer|authorization)\b\s*[:=]\s*\S+"
-    r"|\b(?:sk-|ghp_|gho_|github_pat_|xoxb-|xoxp-|AKIA)[A-Za-z0-9_\-]{8,}")
+    r"(?i)(?:authorization\s*:\s*bearer\s+\S+"
+    r"|\bbearer\s+\S+"
+    r"|\b(?:api[_-]?key|secret|token|password|authorization)\b\s*[:=]\s*\S+"
+    r"|\b(?:sk-|ghp_|gho_|github_pat_|xoxb-|xoxp-|AKIA)[A-Za-z0-9_\-]{8,})")
+
+
+def _ps_quote(s, max_len=120):
+    """LLM 由来テキストをコピペ用 PowerShell コマンドへ安全に埋め込む:
+    空白を正規化 → 単一引用符で囲み、内部の ' は '' にエスケープ(変数展開・$()・` を無効化)。"""
+    t = re.sub(r"\s+", " ", str(s)).strip()[:max_len]
+    return "'" + t.replace("'", "''") + "'"
 
 
 def write_memory_suggestions(charter, cands, survivors, run, cfg):
@@ -1676,17 +1686,17 @@ def write_memory_suggestions(charter, cands, survivors, run, cfg):
     # 1) kill?(LLM) → 理由を人間確認の上 reject 候補(decisions.jsonl へ)
     for c in survivors:
         if c.get("_llm_kill"):
-            reason = (c.get("_llm_kill_reason") or "").replace('"', "'")[:120]
+            reason = re.sub(r"\s+", " ", c.get("_llm_kill_reason") or "").strip()[:120]
             add("decision", "memory/decisions.jsonl",
                 f"{c['id']} は LLM が棄却を推奨(要確認): {reason}",
                 "棄却理由が客観的に正しいか確認し、正しければ reject として記録すると次回から再提案されない。",
                 [f"verdicts/{c['id']}.json"],
-                f'python orchestrate.py reject {rid} {c["id"]} --note "{reason}"')
+                f'python orchestrate.py reject {rid} {c["id"]} --note {_ps_quote(reason)}')
     # 2) 生存案の採否の記録(1件にまとめる — 候補ごとに出すとノイズ)
     alive = [c for c in survivors if not c.get("_llm_kill")]
     if alive:
         cmds = "\n".join(
-            f'python orchestrate.py promote {rid} {c["id"]} --note "<追求する理由>"   # 却下なら reject'
+            f"python orchestrate.py promote {rid} {c['id']} --note '<追求する理由>'   # 却下なら reject"
             for c in alive)
         add("decision", "memory/decisions.jsonl",
             f"生存 {len(alive)} 候補({', '.join(c['id'] for c in alive)})の採否を記録する",
@@ -1700,7 +1710,7 @@ def write_memory_suggestions(charter, cands, survivors, run, cfg):
             f"過去 run と類似の候補が {len(dups)} 件({', '.join(c['id'] for c in dups)})",
             "同じ方向が繰り返し出ている。深めるなら好みとして、避けるなら回避方針として記録すると生成が変わる。",
             [f"類似元 run: {', '.join(runs_hit[:3])}"],
-            'python orchestrate.py prefer "<この方向を深める / 避ける 等の方針>"')
+            "python orchestrate.py prefer '<この方向を深める / 避ける 等の方針>'")
     # 4) engine 失敗の反復(≥2回)→ failure_pattern(issue 化候補)
     fails = [l for l in run.get("_logbuf", []) if "FAILED" in l or "失敗" in l]
     if len(fails) >= 2:
@@ -1708,7 +1718,8 @@ def write_memory_suggestions(charter, cands, survivors, run, cfg):
             f"engine 失敗/フォールバックが {len(fails)} 回発生",
             "反復する失敗は run 固有でなく構造的な可能性。issue 化して原因(timeout/セッション/プロンプト)を追う。",
             ["run.log"],
-            f'gh issue create --label bug --title "engine 失敗の反復(run {rid})" --body "run.log 参照"')
+            f"gh issue create --label bug --title {_ps_quote(f'engine 失敗の反復(run {rid})')} "
+            f"--body {_ps_quote('runs/' + rid + '/run.log 参照')}")
     # 5) proximity の未探索軸 → 次 run の種 / 好みの候補
     axes_u = (run.get("proximity") or {}).get("underexplored_axes") or []
     if axes_u:
@@ -1716,7 +1727,7 @@ def write_memory_suggestions(charter, cands, survivors, run, cfg):
             "未探索の発想軸: " + "; ".join(str(x) for x in axes_u[:5]),
             "候補集合がまだ触れていない角度。次 run の seed にするか、恒久的な好みにするかは人間が判断。",
             ["proximity.json"],
-            'python orchestrate.py prefer "<採用する軸>"  # または次 run の --seed に使う')
+            "python orchestrate.py prefer '<採用する軸>'  # または次 run の --seed に使う")
 
     write_json(run, "memory_suggestions.json",
                {"_note": "提案のみ(全件 pending)。自動では memory に保存されない。コマンド実行=承認。",
@@ -1802,7 +1813,7 @@ def report(charter, survivors, all_cands, run):
           "`python orchestrate.py promote <run> <id>` / `reject <run> <id> --note \"理由\"` / `prefer \"好み\"`",
           *([f"\n**Memory suggestions: {run['memory_suggestions_n']} 件** → "
              "`memory_suggestions.md`(提案のみ・コマンド実行=承認 / #48)"]
-            if run.get("memory_suggestions_n") else []),
+            if run.get("memory_suggestions_n") is not None else []),   # 0 件でも明示(acceptance)
           ""]
     write_text(run, "REPORT.md", "\n".join(md))
 
