@@ -137,10 +137,15 @@ def verdict_schema(axes):
 
 
 def extra_axes_text(axes, cfg):
-    """core 4軸を超えるドメイン軸の説明を verifier プロンプトに渡す文。"""
-    descs = {**AXIS_DESC, **cfg.get("eval_axes_desc", {})}
+    """core 4軸を超えるドメイン軸の説明を verifier プロンプトに渡す文。
+    追加軸が無ければ空文字(プロンプト側は『空なら無視』— "(なし)" を注入しない)。
+    eval_axes_desc が null 等の malformed config にも耐える。"""
+    descs = dict(AXIS_DESC)
+    raw = cfg.get("eval_axes_desc") or {}
+    if isinstance(raw, dict):
+        descs.update(raw)
     extra = [a for a in axes if a not in DEFAULT_EVAL_AXES]
-    return "\n".join(f"- **{a}** — {descs.get(a, a)}" for a in extra) if extra else "(なし)"
+    return "\n".join(f"- **{a}** — {descs.get(a, a)}" for a in extra)
 
 
 VERDICT_SCHEMA = verdict_schema(DEFAULT_EVAL_AXES)   # 既定(HEP)。verify は cfg["eval_axes"] で都度生成
@@ -723,7 +728,8 @@ def generate(runner, charter, cfg, run, mem):
 def redteam(runner, cands, cfg, run):
     """cross red-team: 攻撃 -> 検証可能項目に変換。judge しない。"""
     tmpl = load_prompt("redteam")
-    extra_checks = "\n".join(f"- {x}" for x in cfg.get("redteam_extra_checks", [])) or "(なし)"
+    checks = cfg.get("redteam_extra_checks") or []          # 無ければ空文字(プロンプト側は『空なら無視』)
+    extra_checks = "\n".join(f"- {x}" for x in checks)
 
     def one(c):
         label = f"{run['id']}__review_{c['id']}"
