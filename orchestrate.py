@@ -279,8 +279,10 @@ def _engine_argv(engine, exe, seed, cfg):
         # (worker は queue/ 内の read/write のみ。orchestrator は信頼コード)
         # service_tier は config 駆動(#51): flex はプリエンプトされ得るため、quota 逼迫時に
         # config.json で default へ切替えられるようにする(従来は flex がハードコードだった)
-        return [exe, "-c", f"service_tier={cfg.get('service_tier', 'flex')}",
-                "-c", f"model_reasoning_effort={cfg.get('reasoning_effort', 'low')}",
+        # `or` フォールバック: config に "service_tier": null / "" と書かれても
+        # service_tier=None のような壊れた引数を codex に渡さない(PR #54 の Copilot 指摘)
+        return [exe, "-c", f"service_tier={cfg.get('service_tier') or 'flex'}",
+                "-c", f"model_reasoning_effort={cfg.get('reasoning_effort') or 'low'}",
                 "--dangerously-bypass-approvals-and-sandbox", seed]
     if engine == "claude":
         # skip-permissions: BypassPermissions 承認は初回一度きり(~/.claude.json に記録)。
