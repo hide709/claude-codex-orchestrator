@@ -13,6 +13,11 @@
 - `confound` → falsification_fix(その測定では分離できない交絡。検証法の改訂)
 - `stronger_variant` → new_candidate(より新規性/feasibility が高い隣接案)
 
+# ドメイン追加チェック(空なら無視)
+以下の観点が指定されていれば攻撃に含める。表現は**既存の攻撃型(type)に当てはめる**
+(例: 開発案寄り → `stronger_variant` で研究仮説版を提案 / メカニズム弱 → `hidden_assumption` か `feasibility_hole`):
+{{extra_checks}}
+
 # レビュー対象(著者情報は伏せてある)
 {{candidate}}
 
