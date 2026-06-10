@@ -277,7 +277,10 @@ def _engine_argv(engine, exe, seed, cfg):
     if engine == "codex":
         # ネスト環境で codex の windows sandbox spawn が失敗するため、サンドボックスを bypass
         # (worker は queue/ 内の read/write のみ。orchestrator は信頼コード)
-        return [exe, "-c", "service_tier=flex", "-c", f"model_reasoning_effort={cfg.get('reasoning_effort', 'low')}",
+        # service_tier は config 駆動(#51): flex はプリエンプトされ得るため、quota 逼迫時に
+        # config.json で default へ切替えられるようにする(従来は flex がハードコードだった)
+        return [exe, "-c", f"service_tier={cfg.get('service_tier', 'flex')}",
+                "-c", f"model_reasoning_effort={cfg.get('reasoning_effort', 'low')}",
                 "--dangerously-bypass-approvals-and-sandbox", seed]
     if engine == "claude":
         # skip-permissions: BypassPermissions 承認は初回一度きり(~/.claude.json に記録)。
