@@ -46,6 +46,7 @@ runs/<id>/
 ├── REPORT.md            # 人間向けサマリ + 読み方 + 次の一手
 ├── decision_matrix.md   # 生存候補を軸ごとに一覧(勝者は選ばない / kill?(LLM)=要人間確認)
 ├── decision_matrix.json
+├── candidate_reports.md # 候補ごとの詳細・評価・出典の人間向けレポート(#47。平易な日本語ラベル)
 ├── charter.json         # 固定した seed/制約/評価軸/レンズ
 ├── candidates/*.json    # 各 Research Hypothesis Contract
 ├── reviews/*.json       # red-team の攻撃(検証項目へ変換済み)
