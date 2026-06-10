@@ -57,8 +57,21 @@ runs/<id>/
 ├── priority.json        # 次ラウンドの追加検証予算の配分指針(#37。採用判定ではない・breakdown付き)
 ├── discarded.md         # 客観 hard gate 落ちのみ(形不備など。理由付き・消さない)
 ├── unresolved.md        # 未解決論点 + 未追跡の stronger_variant
-└── log/                 # 各LLM呼び出しの生ログ(provenance)
+├── status.json          # engine ごとの現在状態(watchdog #46。watch_run.py が読む)
+├── events.jsonl         # 状態遷移の履歴(directive_sent/parsed/timeout_idle… / #46)
+└── log/                 # 各LLM呼び出しの生ログ(provenance)+ 異常時の session tail
 ```
+
+### 実行を見守る(watchdog / Issue #46)
+LLM セッションがこけた・承認待ち・脱線 をリアルタイムに把握するには、**別ターミナル**で:
+```powershell
+python tools/watch_run.py            # 最新 run の engine 状態を 3 秒間隔で表示(--once で1回)
+```
+- `STATE`: starting / directive_sent / **active**(出力増加中)/ idle_waiting_report / report_tmp_stale /
+  proc_dead / **timeout_idle**(沈黙のまま timeout)/ **timeout_active**(出力は続いたが report が出ず timeout)
+- `HINT`: 承認/ログイン待ちらしき文言のヒューリスティック検出(参考情報。state には昇格させない)
+- 異常時は `log/<label>.session.txt` に直近のセッション出力が自動保存される
+- watchdog は**可視化・診断のみ** — LLM の生出力を採用判断には使わない
 
 ## デュアルエンジン(Codex + Claude Code)— 完全統一
 **codex も claude も headless(codex exec / claude -p)を使わず、両方とも対話セッションに統一**(サブスク内・追加課金なし)。

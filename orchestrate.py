@@ -248,6 +248,56 @@ def _engine_argv(engine, exe, seed, cfg):
     raise ValueError(f"unknown engine {engine}")
 
 
+class EventLog:
+    """run の観測ログ(Issue #46)。**可視化・診断のみ** — LLM の生出力を採用判断に使わない。
+    events.jsonl = 状態遷移の履歴(遷移時のみ追記) / status.json = engine ごとの現在状態(上書き)。
+    dual(2エンジン並走)でも壊れないようプロセス内 lock で直列化。書き込み失敗は run を止めない。"""
+    def __init__(self, rundir):
+        self.dir = Path(rundir)
+        self._lock = threading.Lock()
+        self._status = {}
+
+    def event(self, engine, label, event, **kw):
+        rec = {"ts": _now(), "engine": engine, "label": label, "event": event, **kw}
+        with self._lock:
+            with (self.dir / "events.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    def status(self, engine, **fields):
+        with self._lock:
+            st = self._status.setdefault(engine, {})
+            st.update(fields)
+            st["updated_at"] = _now()
+            tmp = self.dir / "status.json.tmp"
+            tmp.write_text(json.dumps(self._status, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(self.dir / "status.json")
+
+
+EVENTS = None   # main() が run 開始時に EventLog を差す(無ければ全て no-op)
+
+
+def _emit(engine, label, event, **kw):
+    if EVENTS is not None:
+        try:
+            EVENTS.event(engine, label, event, **kw)
+        except Exception:
+            pass
+
+
+def _wd_status(engine, **kw):
+    if EVENTS is not None:
+        try:
+            EVENTS.status(engine, **kw)
+        except Exception:
+            pass
+
+
+# 承認/ログイン待ちらしき文言(ヒューリスティック)。state ではなく hint として併記する
+# (TUI 文字列は version 依存で脆い — ADR-001 の「TUI 解析は最小化」に従い誤検知を state に昇格させない)
+_HINT_RE = re.compile(r"(?i)yes,? i accept|do you trust|grant access|permission|approve|log ?in|sign ?in"
+                      r"|承認|許可し|ログイン")
+
+
 class InteractiveSessionRunner:
     """ADR-001: orchestrator が対話セッション(codex/claude)を **pywinpty(ConPTY)** で spawn・駆動する。
     headless(codex exec / claude -p)を使わない = サブスク内・**追加課金なし**。supervisor が job 単位で
@@ -265,8 +315,11 @@ class InteractiveSessionRunner:
         self.warmup = cfg.get("session_warmup_sec", 8)
         self.enter_delay = cfg.get("inject_enter_delay_sec", 1.5)
         self.buf_max = int(cfg.get("session_buffer_max_chunks", 256))  # TUI 出力の保持上限(チャンク数)
+        self.tmp_stale = int(cfg.get("watchdog_tmp_stale_sec", 60))    # .json.tmp がこの秒数 rename されなければ stale(#46)
         self.proc = None
         self._buf = []
+        self.bytes_total = 0        # watchdog(#46): セッション出力の累計バイト
+        self.last_output_ts = None  # watchdog(#46): 最後に出力が増えた時刻
         self._blk = threading.Lock()
         self._lock = threading.Lock()   # 1セッション=直列。job 注入が交錯しないように
 
@@ -298,11 +351,15 @@ class InteractiveSessionRunner:
                 if d:
                     with self._blk:
                         self._buf.append(d)
+                        self.bytes_total += len(d)
+                        self.last_output_ts = time.time()
                         if len(self._buf) > self.buf_max:      # 無制限に溜めない(_dump は tail しか使わない)
                             del self._buf[: len(self._buf) - self.buf_max]
                 else:
                     time.sleep(0.05)
         threading.Thread(target=_readloop, daemon=True).start()
+        _emit(self.engine, "-", "session_spawn")
+        _wd_status(self.engine, state="starting", label="-", proc_alive=True)
         time.sleep(self.warmup)   # 起動待ち
 
     def _cleanup(self, files, logdir, label, save_invalid=False):
@@ -341,30 +398,76 @@ class InteractiveSessionRunner:
                 self.proc.write(directive)              # 注入: テキストと Enter を別 write に分ける(ADR-001)
                 time.sleep(self.enter_delay)
                 self.proc.write("\r")
+            _emit(self.engine, label, "directive_sent", kind=kind)
+            started = _now()
             waited = 0
+            tmp_seen_ts = None
+            stale_emitted = invalid_emitted = False
             while waited < self.timeout:
+                # --- watchdog(#46): 現在状態を status.json に反映(遷移は events.jsonl へ) ---
+                with self._blk:
+                    btot, lots = self.bytes_total, self.last_output_ts
+                out_age = (time.time() - lots) if lots else None
+                state = "active" if (out_age is not None and out_age <= 2 * self.poll) else "idle_waiting_report"
+                if report_tmp.exists():
+                    if tmp_seen_ts is None:
+                        tmp_seen_ts = time.time()
+                        _emit(self.engine, label, "report_tmp_seen")
+                    if time.time() - tmp_seen_ts > self.tmp_stale and not stale_emitted:
+                        _emit(self.engine, label, "report_tmp_stale",
+                              age_sec=round(time.time() - tmp_seen_ts))
+                        stale_emitted = True
+                    if stale_emitted:
+                        state = "report_tmp_stale"
+                _wd_status(self.engine, state=state, label=label, kind=kind, started_at=started,
+                           bytes_total=btot,
+                           last_output_age_sec=(round(out_age) if out_age is not None else None),
+                           report_tmp_age_sec=(round(time.time() - tmp_seen_ts) if tmp_seen_ts else None),
+                           proc_alive=(self.proc.isalive() if self.proc is not None else False),
+                           hint=self._hint())
                 if report_f.exists():
                     raw = report_f.read_text(encoding="utf-8", errors="replace")
                     try:
                         data = _extract_json(raw)
-                    except Exception:
+                    except Exception as pe:
+                        if not invalid_emitted:
+                            _emit(self.engine, label, "invalid_report_retry", error=str(pe)[:120])
+                            invalid_emitted = True
                         time.sleep(self.poll)      # 途中書き込みの可能性 → 次ポーリングで再読込
                         waited += self.poll
                         continue
                     (logdir / f"{label}.log.txt").write_text(
                         f"[{self.engine}-session] {label}\n--- report ---\n{raw}", encoding="utf-8")
                     self._cleanup((inbox_f, report_f, report_tmp), logdir, label)   # log に残したので queue は掃除
+                    _emit(self.engine, label, "parsed_and_cleaned", bytes_total=btot)
+                    _wd_status(self.engine, state="idle_done", label="-", kind="-", hint="")
                     return data
                 if self.proc is not None and not self.proc.isalive():
                     self._dump(logdir, label, "session が終了(report 未生成)")
                     self._cleanup((inbox_f, report_f, report_tmp), logdir, label, save_invalid=True)
+                    _emit(self.engine, label, "proc_dead")
+                    _wd_status(self.engine, state="proc_dead", proc_alive=False)
                     raise RunnerError(f"{self.engine} session が終了(report 未生成) label={label}")
                 time.sleep(self.poll)
                 waited += self.poll
-            self._dump(logdir, label, f"timeout {self.timeout}s")
+            # timeout: 直前まで出力が増えていたか(脱線/長考)/ 完全に沈黙か(こけた)を区別(#46)
+            tstate = ("timeout_active" if (self.last_output_ts and
+                                           time.time() - self.last_output_ts <= 2 * self.poll)
+                      else "timeout_idle")
+            self._dump(logdir, label, f"timeout {self.timeout}s ({tstate})")
             # parse できない report が残っていれば log/<label>.invalid-report.txt に退避してから掃除
             self._cleanup((inbox_f, report_f, report_tmp), logdir, label, save_invalid=True)
-            raise RunnerError(f"{self.engine} session timeout ({self.timeout}s) label={label}")
+            _emit(self.engine, label, tstate, waited_sec=self.timeout,
+                  invalid_report=invalid_emitted, hint=self._hint())
+            _wd_status(self.engine, state=tstate, hint=self._hint())
+            raise RunnerError(f"{self.engine} session timeout ({self.timeout}s/{tstate}) label={label}")
+
+    def _hint(self):
+        """承認/ログイン待ちらしき文言の検出(ヒューリスティック・参考情報)。"""
+        with self._blk:
+            tail = "".join(self._buf)[-2000:]
+        m = _HINT_RE.search(tail)
+        return f"approval/login らしき文言: …{m.group(0)}…" if m else ""
 
     def _dump(self, logdir, label, note):
         """診断用: セッション(TUI)出力をログに吐く。"""
@@ -393,10 +496,13 @@ class MockRunner:
 
     def run(self, prompt, schema, kind, label, logdir):
         (logdir / f"{label}.log.txt").write_text(f"[mock] {label}\n{prompt[:400]}", encoding="utf-8")
+        _emit("mock", label, "directive_sent", kind=kind)   # watchdog smoke 用(#46)
+        _wd_status("mock", state="active", label=label, kind=kind, proc_alive=True)
         # 候補番号(rq-NN / gen_NN)を優先して拾う。label 先頭の run id(タイムスタンプ)に
         # マッチすると idx==1 の kill 分岐が一生発火しない(mock の gate/priority 検証が死ぬ)
         m = re.search(r"(?:rq-|gen_)(\d+)", label) or re.search(r"(\d+)", label)
         idx = int(m.group(1)) if m else 0
+        _emit("mock", label, "parsed_and_cleaned")
         if kind == "hypothesis":
             lens = label.split("__")[-1]
             return {
@@ -1541,6 +1647,7 @@ DEFAULT_CFG = {
     "queue_poll_sec": 3, "queue_timeout_sec": 600,
     "session_warmup_sec": 8, "inject_enter_delay_sec": 1.5,
     "session_buffer_max_chunks": 256,   # TUI 出力バッファの保持上限(チャンク数。診断 tail 用)
+    "watchdog_tmp_stale_sec": 60,       # .json.tmp がこの秒数 rename されなければ stale 記録(#46)
     # --- 予算プロファイル(Issue #37)。pairwise は全プロファイル 0 既定(opt-in v2 / #36) ---
     # rounds / redteam_per_candidate は charter に記録のみ(rounds>1 の実行は #38)。
     "budget_profile": "",               # "" = 未使用(従来どおり)。quick|normal|deep(--budget で指定)
@@ -1623,6 +1730,8 @@ def main():
         cfg["queue_timeout_sec"] = args.timeout
 
     run = new_run(seed, cfg)
+    global EVENTS
+    EVENTS = EventLog(run["dir"])   # watchdog(#46): runs/<id>/{events.jsonl,status.json}
     mem = load_memory()
     print(f"\n=== RUN {run['id']}  (engine={cfg['engine']}) ===")
     print(f"seed: {seed}")
