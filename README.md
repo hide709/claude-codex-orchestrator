@@ -1,6 +1,6 @@
 # orchestration — IDEA-stage funnel MVP
 
-研究の種を1件、**発散(独立) → red-team(攻撃→検証可能項目) → revise(1回改訂) → Tier0検証 → hard gate → arbiter(整理)**
+研究の種を1件、**発散(独立) → proximity(重複検知・多様性/注釈のみ) → red-team(攻撃→検証可能項目) → revise(1回改訂) → Tier0検証 → hard gate → arbiter(整理)**
 で回し、`Research Hypothesis Contract` と `decision_matrix` を成果物として残す最小システム。
 
 設計の全体像・思想・不変条件は **[ARCHITECTURE.md](./ARCHITECTURE.md)** を参照。このMVPは §11 の左下ループ1周。
@@ -47,8 +47,10 @@ runs/<id>/
 ├── candidates/*.json    # 各 Research Hypothesis Contract
 ├── reviews/*.json       # red-team の攻撃(検証項目へ変換済み)
 ├── revised/*.json       # red-team を受けた改訂版(原案は candidates/ に残す)
-├── evidence/*.json      # arXiv(preprint)/INSPIRE-HEP(権威DB)から機械収集した候補文献
+├── evidence/*.json      # arXiv(preprint)/INSPIRE-HEP/NASA NTRS(権威DB)から機械収集した候補文献
 ├── verdicts/*.json      # Tier0 検証(novelty/soundness/feasibility + prior_art/evidence_refs)
+├── proximity.json       # within-run の重複クラスタ・多様性・未探索軸(#34。注釈のみ・棄却しない)
+├── hypothesis_graph.json# 仮説 lineage(seed→生成→攻撃→改訂→検証 の typed edges / #35)+ .md
 ├── discarded.md         # 客観 hard gate 落ちのみ(形不備など。理由付き・消さない)
 ├── unresolved.md        # 未解決論点 + 未追跡の stronger_variant
 └── log/                 # 各LLM呼び出しの生ログ(provenance)
