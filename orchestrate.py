@@ -550,6 +550,10 @@ class MockRunner:
         delay = float((self.cfg or {}).get("mock_delay_sec") or 0)
         if delay > 0:   # deterministic steering/watchdog smoke 用。既定0なので通常の mock は高速のまま。
             time.sleep(delay)
+        fail_kinds = set((self.cfg or {}).get("mock_fail_kinds") or [])
+        fail_labels = [str(x) for x in ((self.cfg or {}).get("mock_fail_label_contains") or [])]
+        if kind in fail_kinds or any(x in label for x in fail_labels):
+            raise RunnerError(f"mock forced failure kind={kind} label={label}")
         body = prompt if len(prompt) <= 2000 else prompt[:400] + "\n...[snip]...\n" + prompt[-1500:]
         (logdir / f"{label}.log.txt").write_text(f"[mock] {label}\n--- prompt ---\n{body}", encoding="utf-8")
         _emit("mock", label, "directive_sent", kind=kind)   # watchdog smoke 用(#46)
@@ -1144,6 +1148,57 @@ def write_operator_control(run_or_dir):
 
 
 # ----------------------------------------------------------------------------
+# Fallback / degradation accounting (Issue #55)
+# ----------------------------------------------------------------------------
+FALLBACK_LOCK = threading.Lock()
+
+
+def _short_error(e, n=300):
+    return _SECRET_RE.sub("[REDACTED]", str(e))[:n]
+
+
+def record_fallback(run, stage, label, candidate_id="", fallback_type="", effect="", reason="", engine=""):
+    """Record a deterministic degradation event; do not infer from human log text."""
+    rec = {
+        "ts": _now(),
+        "stage": stage,
+        "label": label,
+        "candidate_id": candidate_id,
+        "fallback_type": fallback_type,
+        "effect": effect,
+        "reason": _SECRET_RE.sub("[REDACTED]", str(reason))[:500],
+        "engine": engine,
+    }
+    with FALLBACK_LOCK:
+        run.setdefault("_fallbacks", []).append(rec)
+    return rec
+
+
+def attach_candidate_fallback(c, rec):
+    item = {k: rec[k] for k in ("stage", "candidate_id", "fallback_type", "effect", "engine")
+            if rec.get(k)}
+    c.setdefault("_fallbacks", []).append(item)
+
+
+def fallback_records(run):
+    return list(run.get("_fallbacks") or [])
+
+
+def write_fallbacks(run):
+    recs = fallback_records(run)
+    by_stage = {}
+    affected = sorted({r.get("candidate_id") for r in recs if r.get("candidate_id")})
+    for r in recs:
+        by_stage[r.get("stage", "?")] = by_stage.get(r.get("stage", "?"), 0) + 1
+    write_json(run, "fallbacks.json", {
+        "count": len(recs),
+        "by_stage": by_stage,
+        "affected_candidates": affected,
+        "records": recs,
+    })
+
+
+# ----------------------------------------------------------------------------
 # 段階 (stages)
 # ----------------------------------------------------------------------------
 def planner(seed, constraints, cfg, run):
@@ -1217,6 +1272,7 @@ def generate(runner, charter, cfg, run, mem):
         prompt = apply_steering(prompt, run, "generate", label, "hypothesis", engine=eng)
         used = eng
         used_label = label
+        fallback_rec = None
         try:
             data = get_runner(eng).run(prompt, HYPOTHESIS_SCHEMA, "hypothesis", label, run["log"])
         except Exception as e:
@@ -1226,15 +1282,33 @@ def generate(runner, charter, cfg, run, mem):
                     used_label = f"{label}__fallback_{fallback}"
                     data = get_runner(fallback).run(prompt, HYPOTHESIS_SCHEMA, "hypothesis", used_label, run["log"])
                     used = f"{fallback}(fallback<{eng})"
+                    fallback_rec = record_fallback(
+                        run, "generate", used_label, candidate_id=f"rq-{i:02d}",
+                        fallback_type="engine_retry",
+                        effect=f"{eng} failed; {fallback} generated the candidate",
+                        reason=e, engine=fallback)
                 except Exception as e2:
                     log(run, f"  [gen {lens}] {fallback} も失敗: {e2}")
+                    record_fallback(
+                        run, "generate", label, candidate_id=f"rq-{i:02d}",
+                        fallback_type="candidate_dropped",
+                        effect="candidate was not generated after primary and fallback failures",
+                        reason=f"{eng}: {_short_error(e)} / {fallback}: {_short_error(e2)}",
+                        engine=f"{eng}->{fallback}")
                     return None
             else:
                 log(run, f"  [gen {lens}] FAILED: {e}")
+                record_fallback(
+                    run, "generate", label, candidate_id=f"rq-{i:02d}",
+                    fallback_type="candidate_dropped",
+                    effect="candidate was not generated",
+                    reason=e, engine=eng)
                 return None
         data["id"] = f"rq-{i:02d}"
         data["_lens"] = lens
         data["_engine"] = used
+        if fallback_rec:
+            attach_candidate_fallback(data, fallback_rec)
         # lineage(Issue #35)。アンダースコア内部キー = blind red-team プロンプトにリークしない
         data["_lineage"] = {"hypothesis_id": data["id"], "generation_round": 0, "parents": [],
                             "operator": "generate",
@@ -1365,12 +1439,19 @@ def redteam(runner, cands, cfg, run):
             return c["id"], runner.run(prompt, REVIEW_SCHEMA, "review", label, run["log"])
         except Exception as e:
             log(run, f"  [review {c['id']}] FAILED: {e}")
-            return c["id"], {"attacks": []}
+            rec = record_fallback(
+                run, "redteam", label, candidate_id=c["id"],
+                fallback_type="empty_attacks",
+                effect="red-team failed; attacks=[] so the candidate continued without attacks",
+                reason=e, engine=getattr(runner, "engine", cfg.get("engine", "?")))
+            return c["id"], {"attacks": [], "_fallback": rec}
 
     results = dict(_parallel(cfg, [(one, (c,)) for c in cands]))
     variants = []        # stronger_variant: 未追跡として未解決へ
     for c in cands:
         rv = results.get(c["id"], {"attacks": []})
+        if rv.get("_fallback"):
+            attach_candidate_fallback(c, rv["_fallback"])
         rv["provenance"] = provenance(run, cfg, "redteam", f"{run['id']}__review_{c['id']}", target=c["id"])
         c["_review"] = rv
         write_json(run, f"reviews/{c['id']}.json", rv)
@@ -1424,6 +1505,12 @@ def revise(runner, cands, cfg, run):
             return data
         except Exception as e:
             log(run, f"  [revise {c['id']}] FAILED: {e} / 原案を継続")
+            rec = record_fallback(
+                run, "revise", label, candidate_id=c["id"],
+                fallback_type="original_continued",
+                effect="revise failed; original candidate continued",
+                reason=e, engine=getattr(runner, "engine", cfg.get("engine", "?")))
+            attach_candidate_fallback(c, rec)
             c["_lineage"] = {**c.get("_lineage", {}), "operator": "revise_failed", "parents": [c["id"]]}
             return c
 
@@ -1705,10 +1792,16 @@ def verify(runner, cands, cfg, run, mem):
             return c["id"], verdict
         except Exception as e:
             log(run, f"  [verify {c['id']}] FAILED: {e}")
+            rec = record_fallback(
+                run, "verify", label, candidate_id=c["id"],
+                fallback_type="flag_unverified",
+                effect="verify failed; verdict=flag with all axes 未検証",
+                reason=e, engine=getattr(runner, "engine", cfg.get("engine", "?")))
             fb = {"verdict": "flag", "kill_reason": "",
-                  "notes": f"検証エラー(要再実行): {e}", "prior_art": [],
+                  "notes": f"検証エラー(要再実行): {_short_error(e)}", "prior_art": [],
                   "provenance": provenance(run, cfg, "verify", label, target=c["id"]),
-                  "evidence_refs": evidence_refs(c)}
+                  "evidence_refs": evidence_refs(c),
+                  "_fallback": rec}
             for ax in axes:
                 fb[ax] = {"assessment": "未検証", "confidence": "low"}
             return c["id"], fb
@@ -1716,6 +1809,8 @@ def verify(runner, cands, cfg, run, mem):
     verdicts = dict(_parallel(cfg, [(one, (c,)) for c in cands]))
     for c in cands:
         c["_verdict"] = verdicts.get(c["id"])
+        if (c.get("_verdict") or {}).get("_fallback"):
+            attach_candidate_fallback(c, c["_verdict"]["_fallback"])
         write_json(run, f"verdicts/{c['id']}.json", c["_verdict"])
     return cands
 
@@ -1806,11 +1901,26 @@ def priority_for_next_round(survivors, axes, run):
     return rows
 
 
+def candidate_fallbacks(c):
+    return list(c.get("_fallbacks") or [])
+
+
+def fallback_badge(c):
+    fs = candidate_fallbacks(c)
+    if not fs:
+        return "-"
+    stages = sorted({f.get("stage", "?") for f in fs})
+    if "verify" in stages:
+        return "未検証(fallback: " + ", ".join(stages) + ")"
+    return "劣化あり(fallback: " + ", ".join(stages) + ")"
+
+
 def arbiter(survivors, run, axes=None, cfg=None):
     """idea段の Arbiter = 整理係。勝者を選ばず matrix を人間に出す。
     評価軸は config の eval_axes 駆動(P0: 以前は4軸ハードコードだった)。"""
     axes = list(axes or DEFAULT_EVAL_AXES)
     cfg = cfg or {}
+    show_fallback = any(candidate_fallbacks(c) for c in survivors)
 
     def cell(v, axis):
         a = v.get(axis, {})
@@ -1833,6 +1943,8 @@ def arbiter(survivors, run, axes=None, cfg=None):
             "next_round": (f'{c["_priority"]} → {c.get("_next_action", "-")}'
                            if "_priority" in c else "-"),
         }
+        if show_fallback:
+            row["fallback_warning"] = fallback_badge(c)
         for ax in axes:
             row[ax] = cell(v, ax)
         rows.append(row)
@@ -1845,9 +1957,12 @@ def arbiter(survivors, run, axes=None, cfg=None):
     write_json(run, "decision_matrix.json", rows)
 
     labels = [axis_label(ax, cfg) for ax in axes]   # 人間向けラベル(内部キー併記 / #47)
-    header = ("| id | 発想レンズ | クラスタ | engine | 状態(verdict) | リスク種別 | " + " | ".join(labels)
-              + " | 最短の棄却テスト(cheapest_kill) | next_round(配分) |")
-    sep = "|" + "---|" * (8 + len(axes))
+    header_cols = ["id", "発想レンズ", "クラスタ", "engine", "状態(verdict)"]
+    if show_fallback:
+        header_cols.append("fallback警告")
+    header_cols += ["リスク種別", *labels, "最短の棄却テスト(cheapest_kill)", "next_round(配分)"]
+    header = "| " + " | ".join(header_cols) + " |"
+    sep = "|" + "---|" * len(header_cols)
     md = ["# decision_matrix (人間が読む)\n",
           "**勝者は選んでいない。** AIは候補を出し客観検証しただけ。",
           "どの生存案に *実験予算* を割くかは人間が決める(ARCHITECTURE §3.7 / §5)。",
@@ -1858,7 +1973,10 @@ def arbiter(survivors, run, axes=None, cfg=None):
           "(`priority.json` に内訳)。**採用判定ではない** — 低くても棄却されない(floor / #37)。\n",
           header, sep]
     for r in rows:
-        cells = [r["id"], r["lens"], r["cluster"], r["engine"], r["verdict"], r["risk_type"]]
+        cells = [r["id"], r["lens"], r["cluster"], r["engine"], r["verdict"]]
+        if show_fallback:
+            cells.append(r["fallback_warning"])
+        cells.append(r["risk_type"])
         cells += [r[ax] for ax in axes]
         cells += [r["cheapest_kill"], r.get("next_round", "-")]
         md.append("| " + " | ".join(str(x).replace("|", "/").replace("\n", " ") for x in cells) + " |")
@@ -1966,16 +2084,46 @@ def write_candidate_reports(charter, cands, run, cfg):
     検証状況は現 pipeline が客観的に言えることだけ書く(等級の捏造をしない)。"""
     axes = charter["eval_axes"]
     lab = {ax: axis_label(ax, cfg) for ax in axes}
+    show_fallback = any(candidate_fallbacks(c) for c in cands)
 
     def status_of(c):
         v = c.get("_verdict", {}) or {}
         if v.get("_form_fail"):
-            return "客観棄却(形式不備)"
-        if c.get("_llm_kill"):
-            return "kill?(LLM/要人間確認)"
-        return {"keep": "継続候補", "flag": "要注目(flag)"}.get(v.get("verdict"), v.get("verdict", "?"))
+            base = "客観棄却(形式不備)"
+        elif c.get("_llm_kill"):
+            base = "kill?(LLM/要人間確認)"
+        else:
+            base = {"keep": "継続候補", "flag": "要注目(flag)"}.get(v.get("verdict"), v.get("verdict", "?"))
+        fb = fallback_badge(c)
+        return base if fb == "-" else f"{base} / {fb}"
+
+    def fallback_summary(c):
+        fs = candidate_fallbacks(c)
+        if not fs:
+            return "-"
+        return "; ".join(f"{x.get('stage','?')}:{x.get('fallback_type','fallback')}" for x in fs[:4])
+
+    def fallback_rows(c):
+        fs = candidate_fallbacks(c)
+        if not fs:
+            return []
+        rows = ["", "### ⚠ fallback警告", "| stage | type | effect | label |", "|---|---|---|---|"]
+        for x in fs:
+            rows.append("| " + " | ".join([
+                _md_cell(x.get("stage", "?"), 60),
+                _md_cell(x.get("fallback_type", "fallback"), 80),
+                _md_cell(x.get("effect", ""), 180),
+                _md_cell(x.get("label", ""), 100),
+            ]) + " |")
+        rows.append("")
+        return rows
+
+    def has_fallback_stage(c, stage):
+        return any(x.get("stage") == stage for x in candidate_fallbacks(c))
 
     def weakest(c):
+        if has_fallback_stage(c, "verify"):
+            return "未検証(fallback): verifier 失敗のため再実行が必要"
         v = c.get("_verdict", {}) or {}
         if v.get("_form_fail"):   # 客観棄却の主要情報なので一覧にも理由を出す
             return f"形式不備: {_md_cell(v.get('kill_reason',''), 80)}"
@@ -2004,15 +2152,22 @@ def write_candidate_reports(charter, cands, run, cfg):
           "- 「次に深掘りする優先度」は追加検証の予算配分であり、**採用/棄却の判定ではない**(低くても棄却されない)。",
           "- 内部キー(英語)との対応は末尾の用語対応表を参照。",
           "",
-          "## 候補一覧",
-          "| ID | 問い | engine | 発想レンズ | クラスタ | 状態 | 次に深掘り(配分) | 最大の不確実点 |",
-          "|---|---|---|---|---|---|---|---|"]
+          "## 候補一覧"]
+    summary_header = ["ID", "問い", "engine", "発想レンズ", "クラスタ", "状態"]
+    if show_fallback:
+        summary_header.append("fallback警告")
+    summary_header += ["次に深掘り(配分)", "最大の不確実点"]
+    md += ["| " + " | ".join(summary_header) + " |", "|" + "---|" * len(summary_header)]
     for c in cands:
-        md.append("| " + " | ".join([
+        cells = [
             c["id"], _md_cell(c.get("question", ""), 80), c.get("_engine", "?"),
-            c.get("_lens", "?"), c.get("_cluster_id", "-"), status_of(c),
+            c.get("_lens", "?"), c.get("_cluster_id", "-"), status_of(c)]
+        if show_fallback:
+            cells.append(fallback_summary(c))
+        cells += [
             (f'{c["_priority"]} → {c.get("_next_action","-")}' if "_priority" in c else "-"),
-            weakest(c)]) + " |")
+            weakest(c)]
+        md.append("| " + " | ".join(cells) + " |")
     md.append("")
 
     for c in cands:
@@ -2021,6 +2176,7 @@ def write_candidate_reports(charter, cands, run, cfg):
         lin = c.get("_lineage", {}) or {}
         md += [f"---\n\n## {cid}: {_md_cell(c.get('question',''), 120)}\n",
                f"**状態: {status_of(c)}**\n",
+               *fallback_rows(c),
                "### 1. 案の内容",
                "| 項目 | 内容 |", "|---|---|",
                f"| 問い(question) | {_md_cell(c.get('question'))} |",
@@ -2067,7 +2223,10 @@ def write_candidate_reports(charter, cands, run, cfg):
             md.append(f"| {ATTACK_LABEL.get(a.get('type'), a.get('type','-'))} | "
                       f"{_md_cell(a.get('claim',''), 200)} | {mlabel} | {mstatus} |")
         if not attacks:
-            md.append("| - | (攻撃記録なし) | - | - |")
+            if has_fallback_stage(c, "redteam"):
+                md.append("| fallback | red-team失敗のため攻撃なしで継続 | 再red-team推奨 | 未検証(fallback) |")
+            else:
+                md.append("| - | (攻撃記録なし) | - | - |")
 
         ev = _read_evidence_files(run, cid)
         md += ["", "### 5. 検証・反証の現状(機械的に確認できた事実のみ)",
@@ -2076,6 +2235,8 @@ def write_candidate_reports(charter, cands, run, cfg):
         for prov in ("arxiv", "inspire", "ntrs"):
             if prov in ev:
                 md.append(f"| 文献検索: {prov_names[prov]} | {_provider_status(prov, ev[prov])} |")
+        if has_fallback_stage(c, "verify"):
+            md.append("| verifier | **未検証(fallback)**: verifier 失敗。verdict は flag として継続し、全観点 low confidence |")
         md += ["| toy 計算・シミュレーション実行 | 未実施(実行系は未実装 / #17) |",
                "| 負例・対照チェック | 未実施 |"]
 
@@ -2184,15 +2345,15 @@ def write_memory_suggestions(charter, cands, survivors, run, cfg):
             "同じ方向が繰り返し出ている。深めるなら好みとして、避けるなら回避方針として記録すると生成が変わる。",
             [f"類似元 run: {', '.join(runs_hit[:3])}"],
             "python orchestrate.py prefer '<この方向を深める / 避ける 等の方針>'")
-    # 4) engine 失敗の反復(≥2回)→ failure_pattern(issue 化候補)
-    fails = [l for l in run.get("_logbuf", []) if "FAILED" in l or "失敗" in l]
+    # 4) engine 失敗の反復(≥2回)→ failure_pattern(issue 化候補)。ログ文字列でなく明示カウンタ(#55)を見る。
+    fails = fallback_records(run)
     if len(fails) >= 2:
         add("failure_pattern", "issue",
             f"engine 失敗/フォールバックが {len(fails)} 回発生",
             "反復する失敗は run 固有でなく構造的な可能性。issue 化して原因(timeout/セッション/プロンプト)を追う。",
-            ["run.log"],
+            ["fallbacks.json", "run.log"],
             f"gh issue create --label bug --title {_ps_quote(f'engine 失敗の反復(run {rid})')} "
-            f"--body {_ps_quote('runs/' + rid + '/run.log 参照')}")
+            f"--body {_ps_quote('runs/' + rid + '/fallbacks.json と run.log 参照')}")
     # 5) proximity の未探索軸 → 次 run の種 / 好みの候補
     axes_u = (run.get("proximity") or {}).get("underexplored_axes") or []
     if axes_u:
@@ -2255,6 +2416,13 @@ def report(charter, survivors, all_cands, run):
         _eng[c.get("_engine", "?")] = _eng.get(c.get("_engine", "?"), 0) + 1
     eng_bd = ", ".join(f"{k}:{v}" for k, v in sorted(_eng.items())) or "-"
     steer = _steering_counts(run)
+    write_fallbacks(run)
+    fbs = fallback_records(run)
+    fb_by_stage = {}
+    for f in fbs:
+        fb_by_stage[f.get("stage", "?")] = fb_by_stage.get(f.get("stage", "?"), 0) + 1
+    fb_affected = sorted({f.get("candidate_id") for f in fbs if f.get("candidate_id")})
+    fb_summary = ", ".join(f"{k}:{v}" for k, v in sorted(fb_by_stage.items())) or "-"
     md = [f"# RUN REPORT — {run['id']}\n",
           f"- seed: **{charter['seed']}**",
           f"- constraints: {charter['constraints'] or '(なし)'}",
@@ -2264,6 +2432,13 @@ def report(charter, survivors, all_cands, run):
           + (f" / 内 LLM-kill推奨 {sum(1 for c in survivors if c.get('_llm_kill'))}(要人間確認)"
              if any(c.get('_llm_kill') for c in survivors) else ""),
           f"- created: {run['created']}\n",
+          *(["## ⚠ fallbackによる静かな劣化",
+             f"- この run は **{len(fbs)} job** が失敗し、fallback / 継続処理で完走しています。",
+             f"- stage別: {fb_summary}",
+             f"- 影響候補: {', '.join(fb_affected) if fb_affected else '(候補生成前/候補なし)'}",
+             "- `decision_matrix.md` と `candidate_reports.md` の `fallback警告` を確認してください。",
+             "- 生データ: `fallbacks.json` / `events.jsonl`\n"]
+            if fbs else []),
           "## Operator Steering",
           "- human steering notes guide attention only; they are **not evidence** and do not override charter/verifier output.",
           f"- received: {steer['received']} / applied events: {steer['applied_events']} / "
@@ -2339,7 +2514,8 @@ def new_run(seed, cfg):
     for d in ("candidates", "reviews", "revised", "verdicts", "evidence"):
         (base / d).mkdir(exist_ok=True)
     return {"id": rid, "dir": base, "log": base / "log", "created": _now(),
-            "engine": cfg["engine"], "model": cfg["model"], "commit": _git_commit(), "_logbuf": []}
+            "engine": cfg["engine"], "model": cfg["model"], "commit": _git_commit(),
+            "_logbuf": [], "_fallbacks": []}
 
 
 def write_json(run, rel, obj):
@@ -2377,6 +2553,8 @@ DEFAULT_CFG = {
     "session_buffer_max_chunks": 256,   # TUI 出力バッファの保持上限(チャンク数。診断 tail 用)
     "watchdog_tmp_stale_sec": 60,       # .json.tmp がこの秒数 rename されなければ stale 記録(#46)
     "mock_delay_sec": 0,                # mock steering/watchdog smoke 用。通常は 0
+    "mock_fail_kinds": [],              # Issue #55 smoke 用: ["review", "verdict"] など
+    "mock_fail_label_contains": [],     # Issue #55 smoke 用: ["__revise_"] など
     # --- 予算プロファイル(Issue #37)。pairwise は全プロファイル 0 既定(opt-in v2 / #36) ---
     # rounds / redteam_per_candidate は charter に記録のみ(rounds>1 の実行は #38)。
     "budget_profile": "",               # "" = 未使用(従来どおり)。quick|normal|deep(--budget で指定)
