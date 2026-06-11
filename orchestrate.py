@@ -3,7 +3,7 @@
 orchestrate.py — IDEA-stage funnel MVP   (see ARCHITECTURE.md §11)
 
 研究の種を1件:
-    発散(独立) -> red-team(攻撃->検証可能項目) -> Tier0検証 -> hard gate -> arbiter(整理)
+    案生成(独立) -> red-team(攻撃->検証可能項目) -> Tier0検証 -> hard gate -> arbiter(整理)
 で回し、Research Hypothesis Contract と decision_matrix を「成果物」として残す。
 
 原則 (ARCHITECTURE §0):
@@ -39,7 +39,7 @@ MEMORY_DIR = ROOT / "memory"
 QUEUE_DIR = ROOT / "queue"
 
 # ----------------------------------------------------------------------------
-# 発散レンズ (ARCHITECTURE §3.3 / 研究向け)
+# 発想レンズ (ARCHITECTURE §3.3 / 研究向け)
 # ----------------------------------------------------------------------------
 LENS_DESC = {
     "analogy":       "別分野の手法・結果を、この問題へ転用する角度から発想せよ。",
@@ -1289,7 +1289,7 @@ def provenance(run, cfg, stage, label, **extra):
 
 
 def generate(runner, charter, cfg, run, mem):
-    """発散: レンズごとに独立生成(互いを見ない)。並列。memory で重複回避・好み反映。
+    """案生成: レンズごとに独立生成(互いを見ない)。並列。memory で重複回避・好み反映。
     engines が複数なら engine をレンズに割り当てる(Codex + Claude Code 両方 = default)。"""
     tmpl = load_prompt("ideator")
     lenses = charter["lenses"]
@@ -1886,7 +1886,7 @@ def hard_gate(cands, run):
         lines.append("_(今回 客観 hard gate で落ちた候補は無し)_\n")
     write_text(run, "discarded.md", "\n".join(lines))
     n_llm_kill = sum(1 for c in survivors if c.get("_llm_kill"))
-    log(run, f"  hard gate: 生存 {len(survivors)}(内 LLM-kill推奨 {n_llm_kill}=要人間確認) / 客観棄却 {len(discarded)}")
+    log(run, f"  hard gate: 残った候補 {len(survivors)}(内 LLM-kill推奨 {n_llm_kill}=要人間確認) / 客観棄却 {len(discarded)}")
     return survivors
 
 
@@ -1936,7 +1936,7 @@ def priority_for_next_round(survivors, axes, run):
         "_note": ("priority_for_next_round は『次ラウンドの追加計算資源の配分指針』であり、"
                   "採用/棄却の判定ではない。低 priority でも棄却されず、baseline 検証は全員が受け続ける(floor)。"
                   "既存 artifact からの決定的計算(LLM 不使用)。"),
-        "floor": "all survivors keep full standing; priority allocates EXTRA compute only",
+        "floor": "all remaining candidates keep full standing; priority allocates EXTRA compute only",
         "rows": rows})
     run["priority_rows"] = rows
     by_id = {r["id"]: r for r in rows}
@@ -2081,12 +2081,12 @@ def arbiter(survivors, run, axes=None, cfg=None):
     header_cols = ["id", "発想レンズ", "クラスタ", "engine", "状態(verdict)"]
     if show_fallback:
         header_cols.append("fallback警告")
-    header_cols += ["リスク種別", *labels, "最短の棄却テスト(cheapest_kill)", "next_round(配分)"]
+    header_cols += ["リスク種別", *labels, "最初に試す反証方法(cheapest_kill)", "next_round(配分)"]
     header = "| " + " | ".join(header_cols) + " |"
     sep = "|" + "---|" * len(header_cols)
     md = ["# decision_matrix (人間が読む)\n",
           "**勝者は選んでいない。** AIは候補を出し客観検証しただけ。",
-          "どの生存案に *実験予算* を割くかは人間が決める(ARCHITECTURE §3.7 / §5)。",
+          "どの残った候補に *実験予算* を割くかは人間が決める(ARCHITECTURE §3.7 / §5)。",
           "各候補の詳細・出典は `candidate_reports.md` を参照(#47)。\n",
           "状態(verdict)凡例: `keep` / `flag`(通説違反など要注目で残す) / "
           "`kill?(LLM/要確認)`=LLM は kill 推奨だが客観未確認 → 人間が棄却の妥当性を判断。\n",
@@ -2222,7 +2222,7 @@ def _verification_order_table(survivors, run):
     rows = list(_priority_rows(run))
     if not rows:
         if run.get("priority_rows") is not None or (run["dir"] / "priority.json").exists():
-            return "（生存候補が無いため、次に検証する順番はありません）"
+            return "（残った候補が無いため、次に検証する順番はありません）"
         return "（priority.json がありません）"
     by_id = {c["id"]: c for c in survivors}
     md = ["| 順 | 候補 | 現時点の扱い | 次にやること | 配分点 | 理由 |",
@@ -2276,7 +2276,8 @@ def _first_actions(survivors, run):
     for i, row in enumerate(rows[:3], 1):
         c = by_id.get(row.get("id"), {})
         md.append(f"{i}. **{row.get('id')}**: `{row.get('recommended_next_action', '-')}` — "
-                  f"{_md_cell(c.get('cheapest_kill', '最短確認は candidate_reports.md を参照'), 180)}")
+                  f"最初に試す反証方法: "
+                  f"{_md_cell(c.get('cheapest_kill', 'candidate_reports.md を参照'), 180)}")
     return "\n".join(md) if md else "- 候補なし。"
 
 
@@ -2607,7 +2608,7 @@ def write_candidate_reports(charter, cands, run, cfg):
                f"| 比較基準(baseline) | {_md_cell(c.get('baseline'))} |",
                f"| 成功指標(success_metric) | {_md_cell(c.get('success_metric'))} |",
                f"| 失敗条件(failure_condition) | {_md_cell(c.get('failure_condition'))} |",
-               f"| 最短でダメと分かる確認(cheapest_kill) | {_md_cell(c.get('cheapest_kill'))} |",
+               f"| 最初に試す反証方法(cheapest_kill) | {_md_cell(c.get('cheapest_kill'))} |",
                f"| 前提(assumptions) | {_md_cell('; '.join(c.get('assumptions') or []))} |",
                f"| 未知の点(unknowns) | {_md_cell('; '.join(c.get('unknowns') or []))} |",
                "",
@@ -2679,7 +2680,7 @@ def write_candidate_reports(charter, cands, run, cfg):
                "", "### 7. 次の一手",
                f"- 次に深掘りする優先度(配分・採用判定ではない): "
                f"{c.get('_priority','-')} → `{c.get('_next_action','-')}`(内訳は `priority.json`)",
-               f"- 最短でダメと分かる確認: {_md_cell(c.get('cheapest_kill'))}",
+               f"- 最初に試す反証方法: {_md_cell(c.get('cheapest_kill'))}",
                "",
                "### Traceability",
                f"`candidates/{cid}.json` → `reviews/{cid}.json` → `revised/{cid}.json` → "
@@ -2696,7 +2697,7 @@ def write_candidate_reports(charter, cands, run, cfg):
            "## 用語対応表(内部キー → このレポートの表現)",
            "| 内部キー | 表現 |", "|---|---|",
            *[f"| `{ax}` | {lab[ax]} |" for ax in axes],
-           "| `cheapest_kill` | 最短でダメと分かる確認 |",
+           "| `cheapest_kill` | 最初に試す反証方法 |",
            "| `confidence` | 根拠の強さ(低/中/高) |",
            "| `priority_for_next_round` | 次に深掘りする優先度(追加検証の配分。採用判定ではない) |",
            "| `prior_art` | 近い先行研究 |",
@@ -2745,14 +2746,14 @@ def write_memory_suggestions(charter, cands, survivors, run, cfg):
                 "棄却理由が客観的に正しいか確認し、正しければ reject として記録すると次回から再提案されない。",
                 [f"verdicts/{c['id']}.json"],
                 f'python orchestrate.py reject {rid} {c["id"]} --note {_ps_quote(reason)}')
-    # 2) 生存案の採否の記録(1件にまとめる — 候補ごとに出すとノイズ)
+    # 2) 残った候補の採否の記録(1件にまとめる — 候補ごとに出すとノイズ)
     alive = [c for c in survivors if not c.get("_llm_kill")]
     if alive:
         cmds = "\n".join(
             f"python orchestrate.py promote {rid} {c['id']} --note '<追求する理由>'   # 却下なら reject"
             for c in alive)
         add("decision", "memory/decisions.jsonl",
-            f"生存 {len(alive)} 候補({', '.join(c['id'] for c in alive)})の採否を記録する",
+            f"残った候補 {len(alive)} 件({', '.join(c['id'] for c in alive)})の採否を記録する",
             "promote/reject を記録して初めて重複回避・次回生成に効く(記録しないと memory は育たない)。",
             ["decision_matrix.md", "candidate_reports.md"], cmds)
     # 3) 過去 run との重複が反復(≥2件)→ 方針(preference)の記録候補
@@ -2845,7 +2846,7 @@ def report(charter, survivors, all_cands, run, cfg):
         f"- constraints: {charter['constraints'] or '(なし)'}",
         *([f"- domain: {charter['domain']}"] if charter.get("domain") else []),
         f"- engine: {run['engine']} / model: {run['model']}（生成 engine 内訳: {eng_bd}）",
-        f"- 生成 {len(all_cands)} / 生存 {len(survivors)} / 客観棄却 {len(all_cands)-len(survivors)}"
+        f"- 生成 {len(all_cands)} / 残った候補 {len(survivors)} / 客観棄却 {len(all_cands)-len(survivors)}"
         + (f" / LLM 棄却推奨 {sum(1 for c in survivors if c.get('_llm_kill'))} 件(要人間確認)"
            if any(c.get("_llm_kill") for c in survivors) else ""),
         f"- created: {run['created']}",
@@ -2860,7 +2861,7 @@ def report(charter, survivors, all_cands, run, cfg):
         conclusion.append(f"- 次に検証する候補(決定的配分): **{first_id}** — "
                           f"`{first_row.get('recommended_next_action', '-')}`。採用判定ではありません。")
     else:
-        conclusion.append("- 生存候補が無いため、人間は `discarded.md` と `run.log` を確認してください。")
+        conclusion.append("- 残った候補が無いため、人間は `discarded.md` と `run.log` を確認してください。")
 
     text = render(
         load_template("report_summary.md"),
@@ -3003,9 +3004,9 @@ def main():
     ap.add_argument("--engine", choices=["dual", "codex", "claude", "mock"], help="config を上書き")
     ap.add_argument("--budget", choices=["quick", "normal", "deep"],
                     help="予算プロファイル(#37)。n_lenses 等を一括設定(明示 --n-lenses が優先)")
-    ap.add_argument("--n-lenses", type=int, help="使う発散レンズ数(config を上書き)")
+    ap.add_argument("--n-lenses", type=int, help="使う発想レンズ数(config を上書き)")
     ap.add_argument("--no-lit-search", action="store_true",
-                    help="文献検索(arXiv/INSPIRE)を無効化(offline/高速テスト用)")
+                    help="文献検索(arXiv/INSPIRE/NASA NTRS)を無効化(offline/高速テスト用)")
     ap.add_argument("--engines", help='生成 engine をカンマ区切りで上書き(例: "codex,claude" / "codex")')
     ap.add_argument("--timeout", type=int, help="queue_timeout_sec(1 job の応答待ち上限・秒)を上書き")
     args = ap.parse_args()
@@ -3064,7 +3065,7 @@ def main():
 
     success = False
     try:
-        log(run, "[2/8] GENERATE — 発散(独立・並列・memory反映)")
+        log(run, "[2/8] GENERATE — 案生成(独立・並列・memory反映)")
         cands = generate(runner, charter, cfg, run, mem)
         if not cands:
             print("候補が0件。engine/認証/timeout を確認(--engine mock で配管だけ検証可)。")
@@ -3077,7 +3078,7 @@ def main():
         cands = revise(runner, cands, cfg, run)
         log(run, "[6/8] VERIFY   — Tier0(形/文献/soundness/feasibility)")
         cands = verify(runner, cands, cfg, run, mem)
-        log(run, "[7/8] HARD GATE— kill を捨て案台帳へ")
+        log(run, "[7/8] HARD GATE— 形不備など客観的な不備だけを捨て案台帳へ")
         survivors = hard_gate(cands, run)
         priority_for_next_round(survivors, charter["eval_axes"], run)   # 配分指針(#37)。採用判定ではない
         log(run, "[8/8] ARBITER  — 整理(勝者は選ばない)")
