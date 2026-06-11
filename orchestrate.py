@@ -2213,13 +2213,16 @@ def _prior_art_provider_counts(cands):
     counts = {"arxiv": 0, "inspire": 0, "ntrs": 0, "unknown": 0}
     for c in cands:
         for p in (c.get("_verdict") or {}).get("prior_art") or []:
-            counts[_provider_from_prior_art(p)] = counts.get(_provider_from_prior_art(p), 0) + 1
+            prov = _provider_from_prior_art(p)
+            counts[prov] = counts.get(prov, 0) + 1
     return counts
 
 
 def _verification_order_table(survivors, run):
     rows = list(_priority_rows(run))
     if not rows:
+        if run.get("priority_rows") is not None or (run["dir"] / "priority.json").exists():
+            return "（生存候補が無いため、次に検証する順番はありません）"
         return "（priority.json がありません）"
     by_id = {c["id"]: c for c in survivors}
     md = ["| 順 | 候補 | 現時点の扱い | 次にやること | 配分点 | 理由 |",
@@ -2241,6 +2244,8 @@ def _research_priority_section(run):
     data = run.get("research_priority")
     if not data:
         return "（無効、または未生成）"
+    if data.get("disabled"):
+        return "（設定で無効化: `grow_priority_enabled=false`）"
     if data.get("error"):
         return f"- 推奨生成に失敗: {_md_cell(data.get('error'), 180)}\n- `research_priority.json` を確認してください。"
     recs = sorted(data.get("recommendations") or [], key=lambda r: (r.get("order", 999), r.get("id", "")))
@@ -2338,7 +2343,7 @@ def _warnings_section(run, all_cands):
             by_stage[f.get("stage", "?")] = by_stage.get(f.get("stage", "?"), 0) + 1
         affected = sorted({f.get("candidate_id") for f in fbs if f.get("candidate_id")})
         lines += [
-            f"- fallback / 継続処理: {len(fbs)} job",
+            f"- ⚠ fallbackによる静かな劣化: {len(fbs)} job が失敗し、fallback / 継続処理で完走しています。",
             f"- stage別: {', '.join(f'{k}:{v}' for k, v in sorted(by_stage.items()))}",
             f"- 影響候補: {', '.join(affected) if affected else '(候補生成前/候補なし)'}",
             "- 詳細: `fallbacks.json` / `events.jsonl`",
@@ -2451,7 +2456,6 @@ def research_priority(runner, charter, survivors, cfg, run):
     tmpl = load_prompt("research_priority")
     prompt = render(tmpl,
                     candidates=json.dumps(payload, ensure_ascii=False, indent=2),
-                    next_round_notes=_next_round_notes_text(run),
                     schema=json.dumps(RESEARCH_PRIORITY_SCHEMA, ensure_ascii=False))
     prompt = apply_steering(prompt, run, "next_round", label, "research_priority",
                             engine=getattr(runner, "engine", cfg.get("engine", "?")))
@@ -2831,6 +2835,7 @@ def report(charter, survivors, all_cands, run, cfg):
         _eng[c.get("_engine", "?")] = _eng.get(c.get("_engine", "?"), 0) + 1
     eng_bd = ", ".join(f"{k}:{v}" for k, v in sorted(_eng.items())) or "-"
     write_fallbacks(run)
+    fbs = fallback_records(run)
     first_row = next(iter(_priority_rows(run)), {})
     first_id = first_row.get("id")
     grow_recs = (run.get("research_priority") or {}).get("recommendations") or []
@@ -2845,6 +2850,9 @@ def report(charter, survivors, all_cands, run, cfg):
            if any(c.get("_llm_kill") for c in survivors) else ""),
         f"- created: {run['created']}",
     ]
+    if fbs:
+        conclusion.insert(0, f"- ⚠ **この run は {len(fbs)} job が失敗し fallback で継続** — "
+                             "red-team/verify が欠けた候補があります(詳細: ## 注意 / `fallbacks.json`)")
     if grow_first:
         conclusion.append(f"- 最初に読む候補(LLM 推奨・要確認): **{grow_first.get('id')}** — "
                           f"{_md_cell(grow_first.get('role'), 120)}。採用判定ではありません。")

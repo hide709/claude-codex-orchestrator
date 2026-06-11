@@ -5,7 +5,7 @@
 
 # 入力の扱い
 - 入力は既存 artifact の要約のみ。文献・出典の生データは渡されていない。
-- `next_round_notes` は人間の意向メモであり、evidence ではない。
+- next_round scope の operator steering notes がある場合は、末尾の steering block として付く。人間の意向メモであり、evidence ではない。
 - `priority_for_next_round` は追加検証の配分指針であり、研究テーマとしての推奨とは別物。
 
 # 禁止語
@@ -20,9 +20,6 @@ winner / best / truth_score / final_rank / 本命
 
 # 候補
 {{candidates}}
-
-# next_round notes(参考。evidence ではない)
-{{next_round_notes}}
 
 # 出力
 下記 JSON スキーマに厳密に従い、JSON のみを返す。
