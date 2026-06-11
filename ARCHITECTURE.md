@@ -288,7 +288,7 @@ Planner -> Workers -> Proximity -> Red-team -> Revise -> Verify -> Hard gate -> 
 | `decision_matrix.md` | 評価軸ごとの比較表。勝者は選ばない | view |
 | `priority.json` | 次に検証する順番。決定的計算 | 正本 |
 | `research_priority.json` | 研究として育てる順の LLM 推奨。採用判定ではない | 正本 |
-| `fallbacks.json` | fallback / FAILED で完走した場合の劣化記録 | 正本 |
+| `fallbacks.json` | LLM job の失敗・timeout・出力不備を別手段で補って完走したかの記録 | 正本 |
 | `control/operator_notes.jsonl` | 実行中に人間が入れた steering note | 正本 |
 
 Markdown は基本的に人間向け view であり、JSON artifact が正本。例外的に README / ARCHITECTURE / prompts / templates は設計・運用の正本として扱う。
@@ -450,7 +450,7 @@ attacks:
 | argument_trace | AI の指摘、議論、反論の記録。注意を動かせるが、evidence level は上げない。 |
 | priority_for_next_round | 次に検証する順番。決定的計算で作る。採用判定ではない。 |
 | research_priority | 研究として育てる順の LLM 推奨。要確認であり、採用判定ではない。 |
-| fallback | LLM job 失敗時に劣化状態で続行した記録。完走していても成功扱いにしない。 |
+| fallback | LLM job の失敗、timeout、出力不備を別 engine や既定値で補って run を止めずに続けた記録。`count > 0` の run は通常より注意して読む。 |
 | operator steering | 実行中に人間が注意点を artifact として追記する仕組み。evidence ではない。 |
 | 新しさ(novelty) | 既知研究との差。README や report ではこの日本語ラベルを使う。 |
 | 筋の良さ(soundness) | 物理・理屈として破綻していないか。 |

@@ -108,7 +108,7 @@ python orchestrate.py --seed "..." --constraints "公開データのみ。新規
    文献・出典検索の生データ。検索品質を確認する。
 
 7. `fallbacks.json`
-   fallback が起きると `count > 0` になる劣化記録。`count` が 0 なら劣化なし。0 でない run は注意して読む。`REPORT.md` 冒頭にも警告が出る。
+   LLM job の失敗・timeout・出力不備を別手段で補って完走したかの記録。`count` が 0 なら通常どおり。`count > 0` なら一部の結果を補っているので注意して読む。`REPORT.md` 冒頭にも警告が出る。
 
 ## 出力ディレクトリ
 
@@ -127,7 +127,7 @@ runs/<id>/
   revised/*.json         改訂版
   verdicts/*.json        Tier0 検証結果
   evidence/*.json        文献・出典検索の生データ
-  fallbacks.json         fallback / FAILED の劣化記録(常に生成。count=0 なら劣化なし)
+  fallbacks.json         LLM job の失敗・timeout・出力不備を補って完走したかの記録(常に生成。count=0 なら通常どおり)
   control/               operator steering の note と適用 trace
   log/                   LLM 呼び出しログと session tail
 ```
@@ -144,7 +144,7 @@ AI は候補を出すだけ。
 - `priority.json` は採用順ではなく、次に検証する順番
 - `research_priority.json` は LLM 推奨・要確認
 - `decision_matrix.md` は勝者を選ばない
-- fallback が出た run は劣化しているので、`REPORT.md` 冒頭と `fallbacks.json` を確認する
+- fallback が出た run は、一部の LLM job を別手段で補っているので、`REPORT.md` 冒頭と `fallbacks.json` を確認する
 
 ## 実行中に状態を見る
 
