@@ -1,202 +1,246 @@
-# orchestration — IDEA-stage funnel MVP
+# claude-codex-orchestrator
 
-研究の種を1件、**発散(独立) → proximity(重複検知・多様性/注釈のみ) → red-team(攻撃→検証可能項目) → revise(1回改訂) → Tier0検証 → hard gate → arbiter(整理)**
-で回し、`Research Hypothesis Contract` と `decision_matrix` を成果物として残す最小システム。
+研究アイディアの種を、複数の検証可能な仮説・反証・出典付きレポートに整理する研究支援ツール。
 
-設計の全体像・思想・不変条件は **[ARCHITECTURE.md](./ARCHITECTURE.md)** を参照。このMVPは §11 の左下ループ1周。
+## これは何か
 
-> 原則: **AIは候補を出すだけ。裁くのは客観検証。決めるのは人間。** orchestrator(`orchestrate.py`)はLLMではない。
+`claude-codex-orchestrator` は、曖昧な問いや研究の種を受け取り、複数の候補仮説に広げます。その後、弱点の洗い出し、文献・出典候補の収集、簡易検証、読みやすいレポート化までを1つの run として実行します。
 
-## 必要なもの
-- Python 3.9+ と **pywinpty**(`pip install -r requirements.txt`。Windows 専用)。
-- engine: **default は dual(Codex + Claude Code 両方)**。両方とも **headless を使わない**
-  (`codex exec` / `claude -p` を呼ばない = サブスク内・**追加課金なし**)。orchestrator が **pywinpty(ConPTY)で
-  対話セッションを自動 spawn・駆動**する(ADR-001)。**手動で worker を立てる必要はない。**
-  実行ファイルを解決できない engine は自動で除外(配管確認は `--engine mock`、pywinpty 不要)。
+AI 同士に正解を決めさせるツールではありません。Claude / Codex などの LLM は候補を出すために使い、検証結果・出典・判断材料は artifact としてファイルに残します。最終判断は人間が行います。
 
-## 使い方
+## 何ができるか
 
-```bash
-# まず配管をトークン無しで検証(推奨・最初の一回)
-python orchestrate.py --engine mock --seed "テスト用の問い"
+| できること | まだできないこと |
+|---|---|
+| 研究の種から複数の仮説を出す | 研究の正しさを証明する |
+| 反証・ツッコミを出す | AI の合議で採用判断する |
+| 文献・出典候補を集める | 実験や本格シミュレーションを自動実行する |
+| 読みやすい `REPORT.md` を生成する | 人間の最終判断を代替する |
+| fallback や検索品質を見える化する | 失敗した LLM 出力を自動で信用する |
 
-# 本番(dual = Codex + Claude)。orchestrator が両セッションを pywinpty で自動起動・駆動する
-python orchestrate.py \
-  --seed "ミューオン g-2 の残差を説明する新しい系統誤差源は?" \
-  --constraints "J-PARC E34 の既存データ。新規ビームタイムは不可。計算は手元GPU 1枚"
+## いつ使うか
 
-# レンズ数(=独立候補数)を変える
-python orchestrate.py --seed "..." --n-lenses 6
+- 研究テーマになりそうな問いを広げたい
+- 複数の仮説を比較して、次に検証する順番を決めたい
+- ある仮説の弱点、反証方法、近い先行研究を知りたい
+- 宇宙機など特定ドメイン向けに研究案を出したい
+- LLM が出した案を、そのまま信じずに artifact として監査したい
 
-# engine を明示(default は dual)
-python orchestrate.py --seed "..." --engine codex           # codex のみ
-python orchestrate.py --seed "..." --engine claude          # claude のみ
+## システム全体像
 
-# ドメインを切り替える(例: 宇宙機研究)
-python orchestrate.py --config configs/spacecraft.json --seed "..."
-
-# 予算プロファイル(#37): quick(3レンズ) / normal(6) / deep(6+将来の複数round)
-python orchestrate.py --budget quick --seed "..."
+```text
+Seed / question
+  -> Planner        目的・制約・評価軸を固定
+  -> Generate       複数の候補を独立生成
+  -> Proximity      重複や似た方向を整理
+  -> Red-team       弱点・反証・交絡を出す
+  -> Revise         指摘を受けて候補を改訂
+  -> Verify         文献・形式・筋の良さを確認
+  -> Hard gate      客観的にダメなものだけ落とす
+  -> Arbiter        勝者を決めず、人間向けに整理
+  -> REPORT         次に読む・検証する候補を提示
+  -> Human decision 最終判断
 ```
 
-出力は `runs/<timestamp>-<slug>/` に出る。まず `REPORT.md` と `decision_matrix.md` を読む。
+詳しい設計思想、各コンポーネントの責務、安全境界は [ARCHITECTURE.md](./ARCHITECTURE.md) を参照してください。
 
+## 最初の実行
+
+まずは LLM を呼ばない `mock` で配管を確認します。
+
+```powershell
+python orchestrate.py --engine mock --seed "低軌道での宇宙機において表面物性、形状とCD値の関係性は?" --no-lit-search
 ```
+
+成功すると `runs/<id>/` が作られます。最初に読むのは `runs/<id>/REPORT.md` です。
+
+## 本番実行
+
+既定では `dual` engine です。Codex と Claude Code の両方が使える場合、複数の発想レンズを engine に割り当てて候補を生成します。
+
+```powershell
+python orchestrate.py --seed "ミューオン g-2 の残差を説明する新しい系統誤差源は?"
+```
+
+宇宙機向けの研究アイディアでは、専用 config を使います。
+
+```powershell
+python orchestrate.py --config configs/spacecraft.json --seed "低軌道での宇宙機において表面物性、形状とCD値の関係性は?"
+```
+
+制約を明示したい場合は `--constraints` を足します。
+
+```powershell
+python orchestrate.py --seed "..." --constraints "公開データのみ。新規実験は不可。手元PCで試せる範囲。"
+```
+
+## 主なオプション
+
+| オプション | 意味 | 使う場面 |
+|---|---|---|
+| `--engine mock` | LLM なしで配管確認 | 初回テスト、CI 的な確認 |
+| `--engine codex` | Codex のみ使う | 単一 engine で確認 |
+| `--engine claude` | Claude のみ使う | 単一 engine で確認 |
+| `--config configs/spacecraft.json` | 宇宙機向け設定で実行 | 宇宙機研究 |
+| `--budget quick` | 少ない候補数で速く回す | 試行錯誤 |
+| `--no-lit-search` | 文献検索を切る | offline / 高速確認 |
+| `--n-lenses 6` | 独立候補数を増やす | 広く探索 |
+| `--timeout 900` | 1 job の待ち時間を延ばす | LLM 応答が遅いとき |
+
+## 実行後に何を見るか
+
+1. `REPORT.md`
+   最初に読むサマリ。結論、次に検証する順番、育てる順、注意点を見る。
+
+2. `candidate_reports.md`
+   候補ごとの詳細。一言で、なぜ面白いか、最初に潰す方法、反証されたらどうなるかを見る。
+
+3. `decision_matrix.md`
+   評価軸ごとの整理。勝者は選ばない。人間が比較するための表。
+
+4. `priority.json`
+   次に検証する順番の正本。決定的計算で作る。採用判定ではない。
+
+5. `research_priority.json`
+   LLM 推奨・要確認の「育てる順」。採用判定ではない。
+
+6. `evidence/*.json`
+   文献・出典検索の生データ。検索品質を確認する。
+
+7. `fallbacks.json`
+   LLM job の失敗・timeout・出力不備を別手段で補って完走したかの記録。`count` が 0 なら通常どおり。`count > 0` なら一部の結果を補っているので注意して読む。`REPORT.md` 冒頭にも警告が出る。
+
+## 出力ディレクトリ
+
+主要 artifact は次の通りです。
+
+```text
 runs/<id>/
-├── REPORT.md            # 人間向けサマリ + 読み方 + 次の一手
-├── decision_matrix.md   # 生存候補を軸ごとに一覧(勝者は選ばない / kill?(LLM)=要人間確認)
-├── decision_matrix.json
-├── candidate_reports.md # 候補ごとの詳細・評価・出典の人間向けレポート(#47。平易な日本語ラベル)
-├── charter.json         # 固定した seed/制約/評価軸/レンズ
-├── candidates/*.json    # 各 Research Hypothesis Contract
-├── reviews/*.json       # red-team の攻撃(検証項目へ変換済み)
-├── revised/*.json       # red-team を受けた改訂版(原案は candidates/ に残す)
-├── evidence/*.json      # arXiv(preprint)/INSPIRE-HEP/NASA NTRS(権威DB)から機械収集した候補文献
-├── verdicts/*.json      # Tier0 検証(novelty/soundness/feasibility + prior_art/evidence_refs)
-├── proximity.json       # within-run の重複クラスタ・多様性・未探索軸(#34。注釈のみ・棄却しない)
-├── hypothesis_graph.json# 仮説 lineage(seed→生成→攻撃→改訂→検証 の typed edges / #35)+ .md
-├── priority.json        # 次ラウンドの追加検証予算の配分指針(#37。採用判定ではない・breakdown付き)
-├── memory_suggestions.md# memory に記録すべき候補の自動提案(#48。保存しない・コマンド実行=承認)+ .json
-├── fallbacks.json       # fallback/FAILED で完走した場合の劣化記録(#55)
-├── control/             # operator steering(#53): 人間の途中方向修正 note と適用trace
-├── discarded.md         # 客観 hard gate 落ちのみ(形不備など。理由付き・消さない)
-├── unresolved.md        # 未解決論点 + 未追跡の stronger_variant
-├── status.json          # engine ごとの現在状態(watchdog #46。watch_run.py が読む)
-├── events.jsonl         # 状態遷移の履歴(directive_sent/parsed/timeout_idle… / #46)
-└── log/                 # 各LLM呼び出しの生ログ(provenance)+ 異常時の session tail
+  REPORT.md              最初に読む summary
+  candidate_reports.md   候補ごとの人間向け詳細レポート
+  decision_matrix.md     評価軸ごとの比較表
+  priority.json          次に検証する順番
+  research_priority.json LLM 推奨・要確認の育てる順
+  charter.json           seed、制約、評価軸、レンズ
+  candidates/*.json      生成候補
+  reviews/*.json         red-team 指摘
+  revised/*.json         改訂版
+  verdicts/*.json        Tier0 検証結果
+  evidence/*.json        文献・出典検索の生データ
+  fallbacks.json         LLM job の失敗・timeout・出力不備を補って完走したかの記録(常に生成。count=0 なら通常どおり)
+  control/               operator steering の note と適用 trace
+  log/                   LLM 呼び出しログと session tail
 ```
 
-fallback/FAILED が発生して継続した run は、`REPORT.md` 冒頭に警告が出る。
-該当候補は `decision_matrix.md` / `candidate_reports.md` の `fallback警告` で確認する。
+## 重要な考え方
 
-### 実行を見守る(watchdog / Issue #46)
-LLM セッションがこけた・承認待ち・脱線 をリアルタイムに把握するには、**別ターミナル**で:
-```powershell
-python tools/watch_run.py            # 最新 run の engine 状態を 3 秒間隔で表示(--once で1回)
+```text
+AI は候補を出すだけ。
+裁くのは客観検証。
+決めるのは人間。
 ```
-- `STATE`: starting / directive_sent(job 注入直後)/ **active**(この job の出力が増加中)/
-  idle_waiting_report / report_tmp_stale / **idle_done**(job 完了・次の注入待ち)/ proc_dead /
-  **timeout_idle**(沈黙のまま timeout)/ **timeout_active**(出力は続いたが report が出ず timeout)。
-  active/idle 判定は **job 単位**(前 job の出力時刻を引きずらない)
-- `HINT`: 承認/ログイン待ちらしき文言のヒューリスティック検出(参考情報。state には昇格させない)
-- 異常時は `log/<label>.session.txt` に直近のセッション出力が自動保存される
-- watchdog は**可視化・診断のみ** — LLM の生出力を採用判断には使わない
 
-### 実行中 run へ方向修正を入れる(operator steering / Issue #53)
-実行中の run に、人間が探索方針・注目点を artifact として追記できる。**active turn へ keystroke 割り込みはしない**。
-orchestrator が各 LLM job の安全な境界で note を読み、scope が合う prompt に sticky に付加する。
+- AI debate は evidence ではない
+- `priority.json` は採用順ではなく、次に検証する順番
+- `research_priority.json` は LLM 推奨・要確認
+- `decision_matrix.md` は勝者を選ばない
+- fallback が出た run は、一部の LLM job を別手段で補っているので、`REPORT.md` 冒頭と `fallbacks.json` を確認する
+
+## 実行中に状態を見る
+
+LLM セッションが止まっていないか、承認待ちになっていないかを別ターミナルで確認できます。
 
 ```powershell
-python orchestrate.py steer active "熱モデル残差と単純閾値監視の差分を優先して確認" --scope verify --priority urgent
-python orchestrate.py steer latest  "次回は negative control design を強める" --scope next_round
-python orchestrate.py steer active --revoke op-001
+python tools/watch_run.py
 ```
 
-- scope: `global` / `generate` / `proximity` / `redteam` / `revise` / `verify` / `next_round`。
-- `active` は `runs/ACTIVE.json` の `state=active` のときだけ解決する。完了後の run へ追記する場合は
-  run id または `latest` を明示する。
-- `global` と stage scope は、受信後に該当する全 job へ sticky 適用され、`control/applied_notes.jsonl`
-  に `(note_id × label)` の trace を残す。
-- `next_round` は現MVPでは LLM prompt に注入せず、`memory_suggestions.md` の `prefer` 候補として人間確認に回す。
-- note は **attention を動かすだけ**。evidence level を上げない、hypothesis を kill しない、
-  charter / verifier / hard gate を上書きしない。
-- 監査用 artifact: `control/operator_notes.jsonl`, `control/applied_notes.jsonl`,
-  `control/operator_control.md`, `control/state.json`。`REPORT.md` と `tools/watch_run.py` に件数が出る。
+`STATE` が `active` ならその job の出力が増えています。`timeout_idle` や `proc_dead` が出た場合は `REPORT.md`、`fallbacks.json`、`log/*.session.txt` を確認してください。
 
-## デュアルエンジン(Codex + Claude Code)— 完全統一
-**codex も claude も headless(codex exec / claude -p)を使わず、両方とも対話セッションに統一**(サブスク内・追加課金なし)。
-orchestrator が **pywinpty(ConPTY)で対話セッションを spawn し、job 単位で directive を注入 → `queue/<engine>/reports/<label>.json` で完了検知**(ADR-001)。
-LLM に常駐ループは持たせない(**supervisor がループを所有**)。1セッションを使い回す(warmup は1回、各ステージは注入)。
+## 実行中に方向修正を入れる
 
-- **全ステージが同一セッション経由**: generate はレンズに engine を振り分け、redteam / revise / verify は primary(先頭の生存 engine)が処理。
-- **起動フラグ(自動付与)**: codex=`--dangerously-bypass-approvals-and-sandbox`(ネスト環境の sandbox spawn 失敗を回避)、claude=`--dangerously-skip-permissions`。どちらも write-execute は repo 内に限定(§8)。
-- **生存判定 / degrade**: 実行ファイルを解決できない engine は自動で除外。生存 engine が無ければ終了(`--engine mock` は pywinpty 不要)。タスク失敗時は別の生存 engine にフォールバック。
-- **可視化**: `decision_matrix.md` の `engine` 列・`REPORT.md` の「生成 engine 内訳」で、どちらが各候補を出したか分かる。
+実行中の run に、人間の注意点を artifact として追記できます。active turn にキーストローク割り込みはせず、次の安全な LLM job 境界で prompt に反映されます。
 
-### Windows での実際の動かし方
 ```powershell
-pip install -r requirements.txt             # 初回のみ(pywinpty)
-python orchestrate.py --seed "あなたの問い"     # これだけ。両セッションは自動で起動・駆動される
-```
-→ `生成: N候補 (codex:.., claude:..)` で両エンジン稼働。**別タブで worker を立てる必要はない。**
-
-前提(初回のみ):codex / claude が**ログイン済み**で、claude は一度だけ手動で `--dangerously-skip-permissions` の
-「Yes, I accept」を承認しておく(`~/.claude.json` に記録され、以降 driven セッションでプロンプトは出ない)。
-
-配管だけ試す(pywinpty / トークン不要):
-```bash
-python orchestrate.py --engine mock --no-lit-search --seed "queue test"
+python orchestrate.py steer active "この観点を優先して確認" --scope verify
+python orchestrate.py steer latest "次回は negative control design を強める" --scope next_round
 ```
 
-## 設定 (`config.json`)
-- `engine`: `dual`(default=Codex+Claude) | `codex` | `claude` | `mock`。`engines` で dual の割当。
-- `reasoning_effort`/`service_tier`: **codex の対話起動フラグに渡す**(`-c service_tier=flex -c model_reasoning_effort=low`)。`model` は各セッション側で選ぶため未使用。
-- `queue_poll_sec`/`queue_timeout_sec`: report ポーリング間隔 / 1 job の応答待ち上限(秒。`--timeout` で上書き)。
-- `session_warmup_sec`/`inject_enter_delay_sec`: セッション起動待ち / 注入時に Enter を別送するまでの遅延(秒)。
-- `n_lenses`: 使う発散レンズ数(=独立候補数)。
-- `concurrency`: 並列呼び出し数。
-- `lit_search_enabled` / `inspire_enabled`: Tier0 novelty 補助として arXiv(preprint)と
-  INSPIRE-HEP(権威DB)から候補文献を取得し `evidence/*.{arxiv,inspire}.json` に保存して Verifier に渡す。
-  `--no-lit-search` で一括無効化(offline/高速テスト用)。
-- **検証ゲートの方針**: 自動 reject は**客観基準(形不備など)のみ**。LLM の `kill` は推奨扱いで落とさず、
-  `decision_matrix` に `kill?(LLM/要確認)` として残す(誤kill救済 / ARCHITECTURE §3.6)。
-- `budget_profile` / `budget_profiles`: 予算プロファイル(`--budget quick|normal|deep`)。v1 で効くのは
-  `n_lenses`(レンズプール数で cap)。`rounds`/`redteam_per_candidate` は charter 記録のみ(実行は #38)、
-  `pairwise_matches` は全プロファイル 0 既定(AI debate は opt-in v2 / #36)。
+steering note は evidence ではありません。注意を向けるための情報であり、仮説の採用・棄却や evidence level には影響しません。
 
-## 次ラウンド配分(priority / Issue #37)
-hard gate 後、生存案ごとに **`priority_for_next_round`**(次の**追加**検証予算の配分指針)を
-**既存 artifact から決定的に計算**する(LLM 不使用)。入力は軸 confidence(low/medium)・unknowns 数・
-flag・LLM-kill(棄却理由の人間確認作業)・クラスタ非代表(−)・過去 run 重複(−)で、内訳ごと `priority.json` に残す。
+## Windows / engine の前提
 
-- **採用判定ではない**(ranking ではなく allocation)。decision_matrix の並びも従来どおり verdict 基準のまま。
-- **floor 保証**: 低 priority でも棄却されず、baseline 検証は全員が受け続ける(de-facto kill の防止)。
-- `recommended_next_action` は最も不確実な軸への決定的マッピング(novelty→deeper-lit-search、
-  feasibility→toy-computation 等)。matrix の `next_round(配分)` 列にも併記。
+- Python 3.9+ が必要です。
+- Windows で Codex / Claude Code の対話セッションを駆動するには `pywinpty` が必要です。
+- 現状、`codex` / `claude` engine の対話セッション駆動は Windows + pywinpty 前提です。Windows 以外では `--engine mock` で配管確認する想定です。
+- 初回は次を実行します。
 
-## ドメイン設定(domain config / Issue #40)
-既定(`config.json`)は HEP/加速器向け。**workflow は変えず**、config だけでドメインを差し替える:
+```powershell
+pip install -r requirements.txt
+```
 
-```bash
+- `codex` / `claude` がログイン済みで、PATH から起動できる必要があります。
+- Claude Code は初回のみ `--dangerously-skip-permissions` の承認が必要です。
+- Codex / Claude Code は headless ではなく、pywinpty 経由の対話セッションとして起動します。
+- 起動時に必要な危険フラグは、ネスト環境で sandbox / permission prompt に詰まらないために orchestrator が付与します。Codex は `--dangerously-bypass-approvals-and-sandbox`、Claude Code は `--dangerously-skip-permissions` を使います。worker の書き込み対象は repo 内の queue / run artifact に限定する設計です。
+
+## 詳細設定の補足
+
+- 既定の engine は `dual` です。Codex と Claude Code の両方が解決できる場合は、発想レンズを両 engine に割り当てます。
+- `codex exec` や `claude -p` のような headless 実行は使いません。どちらも対話セッションとして起動します。
+- `reasoning_effort` と `service_tier` は Codex の対話起動時に `-c service_tier=...` / `-c model_reasoning_effort=...` として渡します。
+- `queue_poll_sec` と `queue_timeout_sec` は、LLM job の report を待つ間隔と上限時間です。`--timeout` で待ち時間を上書きできます。
+- 文献検索は config の provider 設定に従います。高速確認や offline 確認では `--no-lit-search` を使います。
+- Claude Code の初回 BypassPermissions 承認は手動で済ませておく必要があります。承認後は driven セッションで同じ確認が出ない前提です。
+
+## ドメイン設定
+
+既定設定は HEP / 加速器寄りです。宇宙機研究では `configs/spacecraft.json` を使います。
+
+```powershell
 python orchestrate.py --config configs/spacecraft.json --seed "宇宙機テレメトリの熱モデル残差で熱系異常を早期検知できるか"
 ```
 
-domain config で差し替わるもの(`configs/spacecraft.json` が実例):
-- `lenses` + `lens_desc` … 発散レンズと説明(spacecraft: telemetry_and_diagnostics / physics_mechanism / modeling_and_simulation / validation_strategy / prior_art_difference)
-- `eval_axes` … decision_matrix / verdict の評価軸。既定4軸に **mechanism_clarity / validation_clarity / baseline_clarity** を追加(軸は増やしても単一スコアには潰さない)
-- evidence providers … spacecraft は **arXiv + NASA NTRS** が primary。**INSPIRE は `inspire_mode: "trigger"`**(放射線/検出器/プラズマ等の語が候補に含まれる時だけ cross-domain hint として検索)。ADS/TechPort は未実装(後回し)
-- `redteam_extra_checks` … red-team の追加観点。**`too_close_to_product_development`(研究仮説ではなく開発改善案に寄りすぎ)** が spacecraft の要
-- `seed_charter_note` … ideator への域内指示(「開発案でなく研究の種を出す」等)
+宇宙機 config では arXiv と NASA NTRS を主な文献・出典 provider として使います。INSPIRE は放射線、検出器、プラズマなどの語が候補に含まれる場合の cross-domain hint として使います。ADS / TechPort 連携は未実装です。
 
-contract には任意フィールド `baseline` / `success_metric` / `failure_condition` / `search_keywords` を追加(全分野で有効、未記入でも形ゲートは通る)。`search_keywords` は文献検索用の英語キーワードで、NTRS/arXiv/INSPIRE collector が候補本文からの語抽出より**優先して**使う(日本語契約でも検索リコールを確保するため)。
+ドメイン config で主に変わるもの:
 
-## メモリ(cross-run / Issue #23)
-run をまたいで「却下した線・採用した方向・好み」を覚え、**次回の生成と検証に反映**する。
-永続するのは **人間が記録した知識だけ**(`memory/`)。`runs/` は使い捨てのまま。
+- 発想レンズ
+- 評価軸
+- 文献・出典 provider
+- red-team の追加チェック
+- ideator へのドメイン指示
 
-```bash
+## メモリに記録する
+
+run の結果を次回以降に反映したい場合だけ、人間が明示的に記録します。
+
+```powershell
 python orchestrate.py promote <run_id> <cand_id> --note "追求する理由"
 python orchestrate.py reject  <run_id> <cand_id> --note "死んだ線の理由"
-python orchestrate.py prefer  "高novelty優先 / ビームダイナミクス系統に注力"
+python orchestrate.py prefer  "高novelty優先 / 宇宙機の物理機構を重視"
 ```
 
-- `memory/decisions.jsonl`(commit)= 採用/却下、`memory/preferences.md`(commit)= 好み、
-  `memory/seen.jsonl`(gitignore)= 重複検知用の自動キャッシュ。
-- 効き方: 却下済みは**再提案しない** / 好みに寄せる / 既出と重複する候補は `REPORT.md` で印(**検知のみ・棄却しない**)。
-- **記録候補の自動提案(#48)**: run 終了時に `memory_suggestions.md` へ「記録すべきこと」
-  (kill?(LLM) の reject 候補 / 生存案の採否 / 重複反復時の方針 / 未探索軸)を**コピペ可能なコマンド付き**で提案。
-  **自動では保存されない** — コマンドの実行が承認(放置=却下)。
-- 原則は ARCHITECTURE §0(AI判断で自動棄却しない)。詳細は `memory/README.md`。
+run 終了時には `memory_suggestions.md` に記録候補が出ます。自動保存はされません。コマンドを実行した場合だけ memory に反映されます。
 
-## このMVPでまだやっていないこと(ARCHITECTURE §12)
-- **Spec / Patch ステージ**(重心は IDEA なので未実装)。
-- **デュアルエンジン(Codex+Claude)実装済み・完全統一**(両方とも headless 不使用、pywinpty 駆動の対話セッション)。
-  ベンダー多様性の追加価値(H2)は #12 のベンチで検証する。
-- 文献検索は arXiv + INSPIRE-HEP を実装。Semantic Scholar/ADS 連携は未実装。
-- 収束ループ(複数ラウンド)は未実装(現状 red-team 後の revise 1回のみ)。
+## トラブルシュート
 
-## 既知の前提
-- **pywinpty** が入っていること(`pip install -r requirements.txt`、Windows 専用)。
-- codex / claude が **ログイン済み**で PATH から起動できること(claude は初回のみ BypassPermissions を手動承認)。
-- driven セッションは `queue/<engine>/` 内のみ読み書きする想定(ARCHITECTURE §8 の Write/Execute プレーン)。
-- 実行ファイルを解決できない engine は自動で外れ、生存ゼロなら終了(`--engine mock` は pywinpty 不要)。
+| 症状 | 見るもの / 対処 |
+|---|---|
+| 何を読めばよいか分からない | まず `REPORT.md`、次に `candidate_reports.md` |
+| engine が起動しない | `--engine mock` で配管確認。codex / claude の PATH とログイン状態を確認 |
+| Windows で動かない | `pip install -r requirements.txt` で pywinpty を入れる |
+| fallback 警告が出る | `REPORT.md` 冒頭、`fallbacks.json`、`candidate_reports.md` を確認 |
+| 文献検索が弱い | `REPORT.md` の文献検索品質、`evidence/*.json`、config を確認 |
+| LLM が止まって見える | `python tools/watch_run.py` と `log/*.session.txt` を確認 |
+
+## まだやっていないこと
+
+- 研究の正しさの証明
+- 本格的な実験やフルシミュレーションの自動実行
+- SPEC / PATCH ステージの本格実装
+- 複数ラウンドの evolution loop
+- ADS / TechPort / Semantic Scholar 連携
+- AI debate を evidence として扱うこと
+- 人間の最終判断の代替
+
+詳細な設計、不変条件、安全境界、artifact contract は [ARCHITECTURE.md](./ARCHITECTURE.md) を参照してください。
