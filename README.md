@@ -57,6 +57,7 @@ runs/<id>/
 ├── hypothesis_graph.json# 仮説 lineage(seed→生成→攻撃→改訂→検証 の typed edges / #35)+ .md
 ├── priority.json        # 次ラウンドの追加検証予算の配分指針(#37。採用判定ではない・breakdown付き)
 ├── memory_suggestions.md# memory に記録すべき候補の自動提案(#48。保存しない・コマンド実行=承認)+ .json
+├── fallbacks.json       # fallback/FAILED で完走した場合の劣化記録(#55)
 ├── control/             # operator steering(#53): 人間の途中方向修正 note と適用trace
 ├── discarded.md         # 客観 hard gate 落ちのみ(形不備など。理由付き・消さない)
 ├── unresolved.md        # 未解決論点 + 未追跡の stronger_variant
@@ -64,6 +65,9 @@ runs/<id>/
 ├── events.jsonl         # 状態遷移の履歴(directive_sent/parsed/timeout_idle… / #46)
 └── log/                 # 各LLM呼び出しの生ログ(provenance)+ 異常時の session tail
 ```
+
+fallback/FAILED が発生して継続した run は、`REPORT.md` 冒頭に警告が出る。
+該当候補は `decision_matrix.md` / `candidate_reports.md` の `fallback警告` で確認する。
 
 ### 実行を見守る(watchdog / Issue #46)
 LLM セッションがこけた・承認待ち・脱線 をリアルタイムに把握するには、**別ターミナル**で:
