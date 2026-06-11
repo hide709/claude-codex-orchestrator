@@ -547,7 +547,11 @@ class MockRunner:
         self.cfg = cfg
 
     def run(self, prompt, schema, kind, label, logdir):
-        (logdir / f"{label}.log.txt").write_text(f"[mock] {label}\n{prompt[:400]}", encoding="utf-8")
+        delay = float((self.cfg or {}).get("mock_delay_sec") or 0)
+        if delay > 0:   # deterministic steering/watchdog smoke 用。既定0なので通常の mock は高速のまま。
+            time.sleep(delay)
+        body = prompt if len(prompt) <= 2000 else prompt[:400] + "\n...[snip]...\n" + prompt[-1500:]
+        (logdir / f"{label}.log.txt").write_text(f"[mock] {label}\n--- prompt ---\n{body}", encoding="utf-8")
         _emit("mock", label, "directive_sent", kind=kind)   # watchdog smoke 用(#46)
         _wd_status("mock", state="active", label=label, kind=kind, proc_alive=True)
         # 候補番号(rq-NN / gen_NN)を優先して拾う。label 先頭の run id(タイムスタンプ)に
@@ -801,6 +805,345 @@ def cmd_memory(kind, argv):
 
 
 # ----------------------------------------------------------------------------
+# Operator steering channel (Issue #53)
+#   Human note -> runs/<id>/control/operator_notes.jsonl -> safe-boundary prompt block.
+#   Notes are sticky: once accepted, they apply to every later matching stage until revoked.
+# ----------------------------------------------------------------------------
+STEERING_SCOPES = {"global", "generate", "proximity", "redteam", "revise", "verify", "next_round"}
+STEERING_PRIORITIES = {"low", "normal", "urgent"}
+STEERING_LOCK = threading.Lock()
+
+
+def _runs_dir():
+    return ROOT / "runs"
+
+
+def _control_dir(run_or_dir):
+    base = Path(run_or_dir["dir"] if isinstance(run_or_dir, dict) else run_or_dir)
+    return base / "control"
+
+
+def _jsonl(path):
+    return _read_jsonl(Path(path))
+
+
+def _append_jsonl_atomic(path, rec):
+    """Append one JSONL record without read/replace races against concurrent readers."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def _replace_text_best_effort(path, text, retries=1):
+    """Regenerate display/control files without letting Windows replace races kill the run."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for attempt in range(retries + 1):
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.{attempt}.tmp")
+        try:
+            tmp.write_text(text, encoding="utf-8")
+            tmp.replace(path)
+            return True
+        except OSError:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if attempt < retries:
+                time.sleep(0.05)
+    return False
+
+
+def _latest_run_dir():
+    runs = sorted([p for p in _runs_dir().glob("*") if p.is_dir()], key=lambda p: p.name, reverse=True)
+    return runs[0] if runs else None
+
+
+def _active_file():
+    return _runs_dir() / "ACTIVE.json"
+
+
+def _read_json_file(path, default=None):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def _run_dir_from_ref(ref):
+    ref = _safe_component(ref, "run_ref") if ref not in ("active", "latest") else ref
+    if ref == "latest":
+        rd = _latest_run_dir()
+        if not rd:
+            raise ValueError("runs/ に run がありません")
+        return rd
+    if ref == "active":
+        st = _read_json_file(_active_file(), {})
+        rid = st.get("run_id")
+        if st.get("state") != "active" or not rid:
+            raise ValueError(
+                "active な run がありません(最後の run は state=%s)。run id か latest を指定してください"
+                % st.get("state", "?"))
+        return _runs_dir() / _safe_component(rid, "run_id")
+    return _runs_dir() / ref
+
+
+def _control_state(run_or_dir):
+    cd = _control_dir(run_or_dir)
+    return _read_json_file(cd / "state.json", {}) or {}
+
+
+def _steering_notes(run_or_dir):
+    return _jsonl(_control_dir(run_or_dir) / "operator_notes.jsonl")
+
+
+def _steering_applied(run_or_dir):
+    return _jsonl(_control_dir(run_or_dir) / "applied_notes.jsonl")
+
+
+def _note_is_active(note, revoked):
+    return note.get("type", "note") == "note" and note.get("status") != "conflicted" and note.get("id") not in revoked
+
+
+def _active_notes_for_stage(run, stage):
+    notes = _steering_notes(run)
+    revoked = {n.get("revokes") for n in notes if n.get("type") == "revoke" and n.get("status") != "conflicted"}
+    active = []
+    for n in notes:
+        if not _note_is_active(n, revoked):
+            continue
+        scope = n.get("scope", "global")
+        if scope == "global" or scope == stage:
+            active.append(n)
+    return active
+
+
+def _applied_keys(run):
+    return {(x.get("note_id"), x.get("label")) for x in _steering_applied(run)}
+
+
+def _steering_counts(run_or_dir):
+    notes = _steering_notes(run_or_dir)
+    applied = _steering_applied(run_or_dir)
+    revoked = {n.get("revokes") for n in notes if n.get("type") == "revoke" and n.get("status") != "conflicted"}
+    note_rows = [n for n in notes if n.get("type", "note") == "note"]
+    conflicted = [n for n in notes if n.get("status") == "conflicted"]
+    applied_ids = {a.get("note_id") for a in applied}
+    pending = [n for n in note_rows
+               if n.get("status") != "conflicted" and n.get("id") not in revoked
+               and n.get("scope") not in ("next_round",) and n.get("id") not in applied_ids]
+    next_round = [n for n in note_rows
+                  if n.get("status") != "conflicted" and n.get("id") not in revoked
+                  and n.get("scope") == "next_round"]
+    return {"received": len(note_rows), "applied_events": len(applied), "applied_notes": len(applied_ids),
+            "pending": len(pending), "next_round": len(next_round),
+            "conflicted": len(conflicted), "revoked": len(revoked)}
+
+
+def init_operator_control(run):
+    cd = _control_dir(run)
+    cd.mkdir(parents=True, exist_ok=True)
+    readme = cd / "README.md"
+    if not readme.exists():
+        readme.write_text(
+            "# Operator Control\n\n"
+            "Human steering notes for this run. Notes guide attention only; they are not evidence,\n"
+            "do not raise evidence level, and do not override the locked charter or verifier output.\n\n"
+            "- `operator_notes.jsonl`: accepted/conflicted/revoked human notes\n"
+            "- `applied_notes.jsonl`: sticky note application events(note_id x LLM job label)\n"
+            "- `state.json`: current control summary\n"
+            "- `operator_control.md`: human-readable trace\n",
+            encoding="utf-8")
+    update_operator_state(run, "active")
+    write_operator_control(run)
+
+
+def update_operator_state(run, state, **extra):
+    cd = _control_dir(run)
+    cd.mkdir(parents=True, exist_ok=True)
+    prev = _control_state(run)
+    data = {**prev, "run_id": run["id"], "state": state, "updated_at": _now(),
+            "started_at": prev.get("started_at") or run.get("created")}
+    if state in ("completed", "failed"):
+        data["completed_at"] = _now()
+    data.update(extra)
+    data["counts"] = _steering_counts(run)
+    _replace_text_best_effort(cd / "state.json", json.dumps(data, ensure_ascii=False, indent=2))
+    af = _active_file()
+    active = {"run_id": run["id"], "state": state, "updated_at": _now(), "path": str(run["dir"])}
+    _replace_text_best_effort(af, json.dumps(active, ensure_ascii=False, indent=2))
+
+
+def _operator_note_text(text):
+    text = re.sub(r"\s+", " ", str(text)).strip()
+    text = _SECRET_RE.sub("[REDACTED]", text)
+    return text[:1200]
+
+
+def _next_note_id(rd):
+    # Best-effort human-facing id. Concurrent steer processes can collide, but JSONL append remains valid.
+    nums = []
+    for n in _steering_notes(rd):
+        m = re.match(r"op-(\d+)$", str(n.get("id", "")))
+        if m:
+            nums.append(int(m.group(1)))
+    return f"op-{(max(nums) + 1) if nums else 1:03d}"
+
+
+def _append_operator_note(rd, note, update_trace=True):
+    with STEERING_LOCK:
+        _append_jsonl_atomic(_control_dir(rd) / "operator_notes.jsonl", note)
+        if update_trace:
+            write_operator_control(rd)
+
+
+def cmd_steer(argv):
+    ap = argparse.ArgumentParser(prog="orchestrate.py steer")
+    ap.add_argument("run_ref", help="run id | active | latest")
+    ap.add_argument("note", nargs="?", help="human steering note")
+    ap.add_argument("--scope", choices=sorted(STEERING_SCOPES), default="global")
+    ap.add_argument("--priority", choices=sorted(STEERING_PRIORITIES), default="normal")
+    ap.add_argument("--author", default="human")
+    ap.add_argument("--revoke", help="note id to revoke")
+    a = ap.parse_args(argv)
+    try:
+        rd = _run_dir_from_ref(a.run_ref)
+    except ValueError as e:
+        print(e)
+        sys.exit(1)
+    if not rd.exists():
+        print(f"run が見つかりません: {rd}")
+        sys.exit(1)
+
+    state = _control_state(rd).get("state", "")
+    ended = state in ("completed", "failed") or (state != "active" and (rd / "REPORT.md").exists())
+    if a.revoke:
+        rec = {"id": _next_note_id(rd), "type": "revoke", "created": _now(), "author": a.author,
+               "revokes": a.revoke, "status": "conflicted" if ended else "active"}
+        if ended:
+            rec["conflict_reason"] = "run is already completed; revoke was recorded but will not affect prompts"
+        _append_operator_note(rd, rec)
+        print(f"steer revoke 記録 → {rd / 'control' / 'operator_notes.jsonl'}")
+        return
+
+    if not a.note or not a.note.strip():
+        ap.error("note が必要です")
+    status = "conflicted" if ended else "active"
+    rec = {"id": _next_note_id(rd), "type": "note", "created": _now(), "scope": a.scope,
+           "priority": a.priority, "author": a.author, "note": _operator_note_text(a.note),
+           "status": status}
+    if ended:
+        rec["conflict_reason"] = "run is already completed; note was not applied"
+    _append_operator_note(rd, rec)
+    print(f"steer note 記録: {rec['id']} ({status}) → {rd / 'control' / 'operator_notes.jsonl'}")
+
+
+def _steering_block(notes, stage):
+    lines = ["",
+             "## Operator steering notes",
+             "These are human steering notes. They may guide attention and next-round allocation.",
+             "They are not evidence. Do not treat them as literature, experiment, verifier result, or truth.",
+             "They cannot raise evidence level, kill a hypothesis, or override the locked charter.",
+             "If a note appears to conflict with the locked charter, preserve the charter and mention the conflict.",
+             f"Current stage: {stage}",
+             ""]
+    for n in notes:
+        lines.append(f"- [{n.get('id')}][scope={n.get('scope')}][priority={n.get('priority')}] {n.get('note')}")
+    return "\n".join(lines) + "\n"
+
+
+def apply_steering(prompt, run, stage, label, kind, engine="?"):
+    """Append sticky human notes at safe LLM job boundaries(stage side, not Runner side)."""
+    notes = _active_notes_for_stage(run, stage)
+    if not notes:
+        return prompt
+    applied_now = []
+    with STEERING_LOCK:
+        done = _applied_keys(run)
+        for n in notes:
+            key = (n.get("id"), label)
+            if key in done:
+                continue
+            rec = {"ts": _now(), "note_id": n.get("id"), "scope": n.get("scope"),
+                   "stage": stage, "label": label, "kind": kind, "engine": engine}
+            _append_jsonl_atomic(_control_dir(run) / "applied_notes.jsonl", rec)
+            applied_now.append(rec)
+        if applied_now:
+            write_operator_control(run)
+    return prompt + _steering_block(notes, stage)
+
+
+def write_operator_control(run_or_dir):
+    rd = Path(run_or_dir["dir"] if isinstance(run_or_dir, dict) else run_or_dir)
+    cd = _control_dir(rd)
+    cd.mkdir(parents=True, exist_ok=True)
+    notes = _steering_notes(rd)
+    applied = _steering_applied(rd)
+    revoked = {n.get("revokes") for n in notes if n.get("type") == "revoke" and n.get("status") != "conflicted"}
+    applied_by_note = {}
+    for a in applied:
+        applied_by_note.setdefault(a.get("note_id"), []).append(a)
+    counts = _steering_counts(rd)
+    md = ["# Operator Control Trace\n",
+          "| item | count |", "|---|---|",
+          f"| received notes | {counts['received']} |",
+          f"| applied note/job events | {counts['applied_events']} |",
+          f"| pending notes | {counts['pending']} |",
+          f"| next_round notes | {counts['next_round']} |",
+          f"| conflicted notes | {counts['conflicted']} |",
+          f"| revoked notes | {counts['revoked']} |",
+          "",
+          "## Applied",
+          "| note_id | scope | applied_to | engine | summary |", "|---|---|---|---|---|"]
+    any_applied = False
+    for n in notes:
+        if not _note_is_active(n, revoked):
+            continue
+        for a in applied_by_note.get(n.get("id"), []):
+            md.append("| " + " | ".join([
+                n.get("id", ""), n.get("scope", ""), a.get("label", ""), a.get("engine", ""),
+                str(n.get("note", "")).replace("|", "/")[:160]]) + " |")
+            any_applied = True
+    if not any_applied:
+        md.append("| - | - | - | - | - |")
+
+    md += ["", "## Pending",
+           "| note_id | scope | reason | summary |", "|---|---|---|---|"]
+    any_pending = False
+    for n in notes:
+        if not _note_is_active(n, revoked):
+            continue
+        if n.get("scope") == "next_round":
+            md.append(f"| {n.get('id')} | next_round | 次 run / memory_suggestions へ反映候補 | {str(n.get('note','')).replace('|','/')[:160]} |")
+            any_pending = True
+        elif not applied_by_note.get(n.get("id")):
+            md.append(f"| {n.get('id')} | {n.get('scope')} | scope に合う後続 job 待ち | {str(n.get('note','')).replace('|','/')[:160]} |")
+            any_pending = True
+    if not any_pending:
+        md.append("| - | - | - | - |")
+
+    md += ["", "## Conflicted / Revoked",
+           "| note_id | type | reason | summary |", "|---|---|---|---|"]
+    any_conf = False
+    for n in notes:
+        if n.get("status") == "conflicted" or n.get("type") == "revoke" or n.get("id") in revoked:
+            reason = n.get("conflict_reason") or ("revoked" if n.get("id") in revoked else "")
+            md.append(f"| {n.get('id')} | {n.get('type','note')} | {reason} | {str(n.get('note') or n.get('revokes') or '').replace('|','/')[:160]} |")
+            any_conf = True
+    if not any_conf:
+        md.append("| - | - | - | - |")
+    _replace_text_best_effort(cd / "operator_control.md", "\n".join(md) + "\n")
+
+    st = _control_state(rd)
+    if not st:
+        st = {"run_id": rd.name, "state": "completed" if (rd / "REPORT.md").exists() else "unknown"}
+    st.update({"updated_at": _now(), "counts": counts})
+    _replace_text_best_effort(cd / "state.json", json.dumps(st, ensure_ascii=False, indent=2))
+    return counts
+
+
+# ----------------------------------------------------------------------------
 # 段階 (stages)
 # ----------------------------------------------------------------------------
 def planner(seed, constraints, cfg, run):
@@ -871,6 +1214,7 @@ def generate(runner, charter, cfg, run, mem):
                         lens=lens, lens_desc=lens_desc_map.get(lens, lens), memory=digest,
                         domain_note=cfg.get("seed_charter_note", ""),
                         schema=json.dumps(HYPOTHESIS_SCHEMA, ensure_ascii=False))
+        prompt = apply_steering(prompt, run, "generate", label, "hypothesis", engine=eng)
         used = eng
         used_label = label
         try:
@@ -971,6 +1315,8 @@ def proximity(runner, cands, charter, cfg, run):
                         candidates=json.dumps(shown, ensure_ascii=False, indent=2),
                         clusters=json.dumps(fixed, ensure_ascii=False, indent=2),
                         schema=json.dumps(PROXIMITY_SCHEMA, ensure_ascii=False))
+        prompt = apply_steering(prompt, run, "proximity", label, "proximity",
+                                engine=getattr(runner, "engine", cfg.get("engine", "?")))
         try:
             res = runner.run(prompt, PROXIMITY_SCHEMA, "proximity", label, run["log"])
             lbl = {x.get("cluster_id"): x for x in res.get("clusters", [])}
@@ -1013,6 +1359,8 @@ def redteam(runner, cands, cfg, run):
         prompt = render(tmpl, candidate=json.dumps(shown, ensure_ascii=False, indent=2),
                         extra_checks=extra_checks,
                         schema=json.dumps(REVIEW_SCHEMA, ensure_ascii=False))
+        prompt = apply_steering(prompt, run, "redteam", label, "review",
+                                engine=getattr(runner, "engine", cfg.get("engine", "?")))
         try:
             return c["id"], runner.run(prompt, REVIEW_SCHEMA, "review", label, run["log"])
         except Exception as e:
@@ -1053,6 +1401,8 @@ def revise(runner, cands, cfg, run):
                         candidate=json.dumps(shown, ensure_ascii=False, indent=2),
                         review=json.dumps(c.get("_review", {"attacks": []}), ensure_ascii=False, indent=2),
                         schema=json.dumps(HYPOTHESIS_SCHEMA, ensure_ascii=False))
+        prompt = apply_steering(prompt, run, "revise", label, "hypothesis",
+                                engine=getattr(runner, "engine", cfg.get("engine", "?")))
         try:
             data = runner.run(prompt, HYPOTHESIS_SCHEMA, "hypothesis", label, run["log"])
             data["id"] = c["id"]
@@ -1346,6 +1696,8 @@ def verify(runner, cands, cfg, run, mem):
                         extra_axes=extra_axes,
                         prior_art_hint=json.dumps(prior_art_hint, ensure_ascii=False, indent=2),
                         schema=json.dumps(vschema, ensure_ascii=False))
+        prompt = apply_steering(prompt, run, "verify", label, "verdict",
+                                engine=getattr(runner, "engine", cfg.get("engine", "?")))
         try:
             verdict = runner.run(prompt, vschema, "verdict", label, run["log"])
             verdict["provenance"] = provenance(run, cfg, "verify", label, target=c["id"])
@@ -1849,6 +2201,19 @@ def write_memory_suggestions(charter, cands, survivors, run, cfg):
             "候補集合がまだ触れていない角度。次 run の seed にするか、恒久的な好みにするかは人間が判断。",
             ["proximity.json"],
             "python orchestrate.py prefer '<採用する軸>'  # または次 run の --seed に使う")
+    # 6) operator steering の next_round note → 次 run へ持ち越す preference 候補(#53)
+    notes = _steering_notes(run)
+    revoked = {n.get("revokes") for n in notes if n.get("type") == "revoke" and n.get("status") != "conflicted"}
+    next_notes = [n for n in notes
+                  if n.get("type", "note") == "note" and n.get("status") != "conflicted"
+                  and n.get("id") not in revoked and n.get("scope") == "next_round"]
+    for n in next_notes:
+        note_text = n.get("note", "")
+        add("operator_steering", "memory/preferences.md",
+            f"次 run に持ち越す operator steering: {note_text[:120]}",
+            "next_round scope の note は現MVPではLLM jobへ直接注入せず、次 run の seed/preference 候補として人間確認に回す。",
+            ["control/operator_notes.jsonl"],
+            f"python orchestrate.py prefer {_ps_quote(note_text, 240)}")
 
     write_json(run, "memory_suggestions.json",
                {"_note": "提案のみ(全件 pending)。自動では memory に保存されない。コマンド実行=承認。",
@@ -1889,6 +2254,7 @@ def report(charter, survivors, all_cands, run):
     for c in all_cands:
         _eng[c.get("_engine", "?")] = _eng.get(c.get("_engine", "?"), 0) + 1
     eng_bd = ", ".join(f"{k}:{v}" for k, v in sorted(_eng.items())) or "-"
+    steer = _steering_counts(run)
     md = [f"# RUN REPORT — {run['id']}\n",
           f"- seed: **{charter['seed']}**",
           f"- constraints: {charter['constraints'] or '(なし)'}",
@@ -1898,6 +2264,12 @@ def report(charter, survivors, all_cands, run):
           + (f" / 内 LLM-kill推奨 {sum(1 for c in survivors if c.get('_llm_kill'))}(要人間確認)"
              if any(c.get('_llm_kill') for c in survivors) else ""),
           f"- created: {run['created']}\n",
+          "## Operator Steering",
+          "- human steering notes guide attention only; they are **not evidence** and do not override charter/verifier output.",
+          f"- received: {steer['received']} / applied events: {steer['applied_events']} / "
+          f"pending: {steer['pending']} / next_round: {steer['next_round']} / "
+          f"conflicted: {steer['conflicted']} / revoked: {steer['revoked']}",
+          "- trace: `control/operator_control.md` / raw: `control/operator_notes.jsonl`, `control/applied_notes.jsonl`\n",
           *(["## ⚠ 過去 run との重複注意(検知のみ・棄却ではない)",
              *[f"- {c['id']}: 過去 {c['_near_dup']['run']}/{c['_near_dup']['id']} と類似 "
                f"(bigram {c['_near_dup']['score']})" for c in all_cands if c.get('_near_dup')], ""]
@@ -1963,6 +2335,7 @@ def new_run(seed, cfg):
     rid = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + _slug(seed)
     base = ROOT / "runs" / rid
     (base / "log").mkdir(parents=True, exist_ok=True)
+    (base / "control").mkdir(exist_ok=True)
     for d in ("candidates", "reviews", "revised", "verdicts", "evidence"):
         (base / d).mkdir(exist_ok=True)
     return {"id": rid, "dir": base, "log": base / "log", "created": _now(),
@@ -2003,6 +2376,7 @@ DEFAULT_CFG = {
     "session_warmup_sec": 8, "inject_enter_delay_sec": 1.5,
     "session_buffer_max_chunks": 256,   # TUI 出力バッファの保持上限(チャンク数。診断 tail 用)
     "watchdog_tmp_stale_sec": 60,       # .json.tmp がこの秒数 rename されなければ stale 記録(#46)
+    "mock_delay_sec": 0,                # mock steering/watchdog smoke 用。通常は 0
     # --- 予算プロファイル(Issue #37)。pairwise は全プロファイル 0 既定(opt-in v2 / #36) ---
     # rounds / redteam_per_candidate は charter に記録のみ(rounds>1 の実行は #38)。
     "budget_profile": "",               # "" = 未使用(従来どおり)。quick|normal|deep(--budget で指定)
@@ -2047,6 +2421,9 @@ def main():
     # memory 書き込み用サブコマンド(人間が採用/却下/好みを記録)
     if len(sys.argv) > 1 and sys.argv[1] in ("promote", "reject", "prefer"):
         return cmd_memory(sys.argv[1], sys.argv[2:])
+    # operator steering channel(Issue #53): 実行中 run への human note を artifact に残す
+    if len(sys.argv) > 1 and sys.argv[1] == "steer":
+        return cmd_steer(sys.argv[2:])
 
     ap = argparse.ArgumentParser(description="IDEA-stage funnel MVP (ARCHITECTURE §11)")
     ap.add_argument("--seed", help="研究の種(問い or hunch)")
@@ -2087,6 +2464,7 @@ def main():
     run = new_run(seed, cfg)
     global EVENTS
     EVENTS = EventLog(run["dir"])   # watchdog(#46): runs/<id>/{events.jsonl,status.json}
+    init_operator_control(run)       # operator steering(#53): control/ と ACTIVE.json を初期化
     mem = load_memory()
     print(f"\n=== RUN {run['id']}  (engine={cfg['engine']}) ===")
     print(f"seed: {seed}")
@@ -2105,12 +2483,14 @@ def main():
                   " `pip install -r requirements.txt`(Windows 以外は未対応 / ADR-001)。")
         print("  codex / claude が PATH か既定の場所にあるか確認(新しいターミナルの PATH に入っているか)。")
         print("  配管だけ確認するなら: --engine mock")
+        update_operator_state(run, "failed", reason="no usable engine")
         sys.exit(1)
     if live != list(charter["engines"]):
         log(run, f"  注意: 実行ファイル未解決の engine を除外 → 使用 engine {live}(要求 {charter['engines']})")
     charter["engines"] = live
     runner = make_runner_for(live[0], cfg)   # primary。セッションは初回 job で spawn される
 
+    success = False
     try:
         log(run, "[2/8] GENERATE — 発散(独立・並列・memory反映)")
         cands = generate(runner, charter, cfg, run, mem)
@@ -2134,12 +2514,19 @@ def main():
         write_candidate_reports(charter, cands, run, cfg)   # 候補別詳細レポート(#47)
         write_memory_suggestions(charter, cands, survivors, run, cfg)   # 記録候補の提案(#48・保存しない)
         write_unresolved(cands, run)
+        write_operator_control(run)                         # operator steering trace(#53)
         report(charter, survivors, cands, run)
         append_seen(run, cands)                     # 自動メモリ(重複検知用)に追記
         write_text(run, "run.log", "\n".join(run["_logbuf"]))
+        success = True
         print(f"\n✅ 完了 → {run['dir']}")
         print(f"   まず読む: {run['dir'] / 'REPORT.md'}  /  {run['dir'] / 'decision_matrix.md'}")
     finally:
+        try:
+            write_operator_control(run)
+            update_operator_state(run, "completed" if success else "failed")
+        except Exception:
+            pass
         shutdown_runners()                          # spawn した対話セッションを終了
 
 

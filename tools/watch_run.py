@@ -53,6 +53,21 @@ def show(rd):
                   f"{s.get('hint','')}")
     else:
         print("(status.json なし — run 直後か、watchdog 以前の run)")
+    ctl_p = rd / "control" / "state.json"
+    if ctl_p.exists():
+        try:
+            ctl = json.loads(ctl_p.read_text(encoding="utf-8"))
+            c = ctl.get("counts", {})
+            print("STEERING "
+                  f"state={ctl.get('state','-')} "
+                  f"received={c.get('received', 0)} "
+                  f"applied_events={c.get('applied_events', 0)} "
+                  f"pending={c.get('pending', 0)} "
+                  f"next_round={c.get('next_round', 0)} "
+                  f"conflicted={c.get('conflicted', 0)} "
+                  f"revoked={c.get('revoked', 0)}")
+        except Exception as e:
+            print(f"STEERING (state.json 読めず: {e})")
     ev_p = rd / "events.jsonl"
     if ev_p.exists():
         print("--- 直近イベント ---")
