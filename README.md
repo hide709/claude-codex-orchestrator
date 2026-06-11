@@ -56,7 +56,7 @@ python orchestrate.py --engine mock --seed "低軌道での宇宙機において
 
 ## 本番実行
 
-既定では `dual` engine です。Codex と Claude Code の両方が使える場合、複数の発想レンズを engine に割り当てて候補を生成します。
+既定では `dual` engine です。Codex と Claude Code の両方が使える場合、複数の発想レンズ(案を出すときの見方・切り口)を engine に割り当てて候補を生成します。
 
 ```powershell
 python orchestrate.py --seed "ミューオン g-2 の残差を説明する新しい系統誤差源は?"
@@ -84,7 +84,7 @@ python orchestrate.py --seed "..." --constraints "公開データのみ。新規
 | `--config configs/spacecraft.json` | 宇宙機向け設定で実行 | 宇宙機研究 |
 | `--budget quick` | 少ない候補数で速く回す | 試行錯誤 |
 | `--no-lit-search` | 文献検索を切る | offline / 高速確認 |
-| `--n-lenses 6` | 独立候補数を増やす | 広く探索 |
+| `--n-lenses 6` | 使う発想レンズ数を増やす | 広く探索 |
 | `--timeout 900` | 1 job の待ち時間を延ばす | LLM 応答が遅いとき |
 
 ## 実行後に何を見るか
@@ -121,7 +121,7 @@ runs/<id>/
   decision_matrix.md     評価軸ごとの比較表
   priority.json          次に検証する順番
   research_priority.json LLM 推奨・要確認の育てる順
-  charter.json           seed、制約、評価軸、レンズ
+  charter.json           seed、制約、評価軸、発想レンズ
   candidates/*.json      生成候補
   reviews/*.json         red-team 指摘
   revised/*.json         改訂版
@@ -185,7 +185,7 @@ pip install -r requirements.txt
 
 ## 詳細設定の補足
 
-- 既定の engine は `dual` です。Codex と Claude Code の両方が解決できる場合は、発想レンズを両 engine に割り当てます。
+- 既定の engine は `dual` です。Codex と Claude Code の両方が解決できる場合は、発想レンズ(案を出すときの見方・切り口)を両 engine に割り当てます。
 - `codex exec` や `claude -p` のような headless 実行は使いません。どちらも対話セッションとして起動します。
 - `reasoning_effort` と `service_tier` は Codex の対話起動時に `-c service_tier=...` / `-c model_reasoning_effort=...` として渡します。
 - `queue_poll_sec` と `queue_timeout_sec` は、LLM job の report を待つ間隔と上限時間です。`--timeout` で待ち時間を上書きできます。
@@ -200,11 +200,11 @@ pip install -r requirements.txt
 python orchestrate.py --config configs/spacecraft.json --seed "宇宙機テレメトリの熱モデル残差で熱系異常を早期検知できるか"
 ```
 
-宇宙機 config では arXiv と NASA NTRS を主な文献・出典 provider として使います。INSPIRE は放射線、検出器、プラズマなどの語が候補に含まれる場合の cross-domain hint として使います。ADS / TechPort 連携は未実装です。
+宇宙機 config では arXiv と NASA NTRS を主な文献・出典 provider として使います。INSPIRE は放射線、検出器、プラズマなどの語が候補に含まれる場合の cross-domain hint として使います。ADS / TechPort 連携は future provider です。
 
 ドメイン config で主に変わるもの:
 
-- 発想レンズ
+- 発想レンズ(案を出すときの見方・切り口)
 - 評価軸
 - 文献・出典 provider
 - red-team の追加チェック
@@ -239,7 +239,7 @@ run 終了時には `memory_suggestions.md` に記録候補が出ます。自動
 - 本格的な実験やフルシミュレーションの自動実行
 - SPEC / PATCH ステージの本格実装
 - 複数ラウンドの evolution loop
-- ADS / TechPort / Semantic Scholar 連携
+- ADS / TechPort / Semantic Scholar 連携(future provider)
 - AI debate を evidence として扱うこと
 - 人間の最終判断の代替
 

@@ -22,7 +22,7 @@
 
   "_comment": {
     "engine": "dual(=Codex+Claude 両方/default) | codex | claude | mock。",
-    "engines": "engine=dual のとき使うエンジン割当。レンズに i%len で振り分ける。",
+    "engines": "engine=dual のとき使うエンジン割当。発想レンズ(案を出すときの見方・切り口)に i%len で振り分ける。",
     "_driving_note": "codex も claude も headless を廃止。orchestrator が pywinpty(ConPTY)で対話セッションを spawn し job 単位で directive を注入、queue/<engine>/reports/<label>.json で完了検知(ADR-001)。手動 worker 不要。実行ファイルを解決できない engine は自動で除外(mock は常に可)。",
     "queue_poll_sec": "queue/<engine>/reports をポーリングする間隔(秒)。",
     "queue_timeout_sec": "1 job の応答待ち上限(秒。--timeout で上書き)。",
@@ -30,8 +30,8 @@
     "inject_enter_delay_sec": "2個目以降の job 注入で、テキスト送信後に Enter を別送するまでの遅延(秒。ADR-001 の paste 回避)。",
     "model_reasoning_service": "reasoning_effort/service_tier は codex の対話起動フラグ(-c service_tier / -c model_reasoning_effort)に渡す。model は各セッション側で選ぶため未使用。",
     "grow_priority_enabled": "REPORT に『育てる順(LLM 推奨・要確認)』を出す。採用判定・hard gate・decision_matrix には使わない。",
-    "n_lenses": "lenses の先頭から何個使うか(=生成する独立候補数)。",
-    "lit_search_enabled": "Tier0 novelty 用に arXiv/INSPIRE から候補文献を取得し evidence/*.{arxiv,inspire}.json に保存(--no-lit-search で無効化)。",
+    "n_lenses": "lenses の先頭から何個使うか。lens は候補を出すときの見方・切り口で、engine ではない。",
+    "lit_search_enabled": "Tier0 novelty 用に arXiv/INSPIRE/NASA NTRS から候補文献を取得し evidence/*.{arxiv,inspire,ntrs}.json に保存(--no-lit-search で無効化)。",
     "inspire_enabled": "INSPIRE-HEP(HEP の権威DB)検索の有効/無効。lit_search_enabled が false なら無視。"
   }
 }

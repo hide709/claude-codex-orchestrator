@@ -7,7 +7,7 @@
     "physics_mechanism":        "宇宙機に関する物理・工学メカニズムに基づく研究仮説を出す(単なる設計改善ではない)。",
     "modeling_and_simulation":  "toy model / 数値シミュレーションに落とせる研究仮説を出す。",
     "telemetry_and_diagnostics":"テレメトリ・FDIR・異常検知に関する検証可能な研究仮説を出す。",
-    "validation_strategy":      "最初に安く検証・棄却できる(cheapest_kill が明確な)研究仮説を出す。",
+    "validation_strategy":      "少ない手間で最初に検証・反証できる方法(cheapest_kill)が明確な研究仮説を出す。",
     "prior_art_difference":     "既存研究との差分が明確な研究仮説を出す。"
   },
 
@@ -33,9 +33,9 @@
   "_comment": {
     "domain": "spacecraft-research = 宇宙機開発支援ではなく、宇宙機を対象にした『研究の種出し』(Issue #40)。",
     "usage": "python orchestrate.py --config configs/spacecraft.json --seed \"...\"",
-    "lenses": "先頭から n_lenses 個を使う(順序=優先度。MVP はテレメトリ/熱/電力/FDIR/デジタルツイン重視で telemetry を先頭に)。",
+    "lenses": "発想レンズ(案を出すときの見方・切り口)。先頭から n_lenses 個を使う(順序=優先度。MVP はテレメトリ/熱/電力/FDIR/デジタルツイン重視で telemetry を先頭に)。",
     "inspire_mode": "always|trigger|off。spacecraft は trigger(放射線/検出器/DAQ 等の語がある時だけ INSPIRE を cross-domain hint として引く)。",
-    "providers": "arXiv + NASA NTRS を primary、INSPIRE を trigger 時の secondary、ADS/TechPort は後回し。",
+    "providers": "arXiv + NASA NTRS を primary、INSPIRE を trigger 時の secondary、ADS/TechPort は future provider。",
     "_design": "config-driven: lenses/lens_desc/eval_axes/providers/redteam_extra_checks は全て config 側で定義。orchestrate.py 本体や domains/ framework は不要(ADR-002)。engine/concurrency/timeout 等は DEFAULT_CFG を継承。"
   }
 }
