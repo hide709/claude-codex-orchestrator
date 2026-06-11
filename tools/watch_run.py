@@ -64,9 +64,10 @@ def show(rd):
                   f"applied_events={c.get('applied_events', 0)} "
                   f"pending={c.get('pending', 0)} "
                   f"next_round={c.get('next_round', 0)} "
-                  f"conflicted={c.get('conflicted', 0)}")
-        except Exception:
-            pass
+                  f"conflicted={c.get('conflicted', 0)} "
+                  f"revoked={c.get('revoked', 0)}")
+        except Exception as e:
+            print(f"STEERING (state.json 読めず: {e})")
     ev_p = rd / "events.jsonl"
     if ev_p.exists():
         print("--- 直近イベント ---")

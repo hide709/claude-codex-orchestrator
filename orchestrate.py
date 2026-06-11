@@ -550,7 +550,8 @@ class MockRunner:
         delay = float((self.cfg or {}).get("mock_delay_sec") or 0)
         if delay > 0:   # deterministic steering/watchdog smoke 用。既定0なので通常の mock は高速のまま。
             time.sleep(delay)
-        (logdir / f"{label}.log.txt").write_text(f"[mock] {label}\n--- prompt ---\n{prompt}", encoding="utf-8")
+        body = prompt if len(prompt) <= 2000 else prompt[:400] + "\n...[snip]...\n" + prompt[-1500:]
+        (logdir / f"{label}.log.txt").write_text(f"[mock] {label}\n--- prompt ---\n{body}", encoding="utf-8")
         _emit("mock", label, "directive_sent", kind=kind)   # watchdog smoke 用(#46)
         _wd_status("mock", state="active", label=label, kind=kind, proc_alive=True)
         # 候補番号(rq-NN / gen_NN)を優先して拾う。label 先頭の run id(タイムスタンプ)に
@@ -827,13 +828,31 @@ def _jsonl(path):
 
 
 def _append_jsonl_atomic(path, rec):
-    """Small JSONL append with atomic replace. A process lock protects in-run parallel writes."""
+    """Append one JSONL record without read/replace races against concurrent readers."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    old = path.read_text(encoding="utf-8") if path.exists() else ""
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    tmp.write_text(old + json.dumps(rec, ensure_ascii=False) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def _replace_text_best_effort(path, text, retries=1):
+    """Regenerate display/control files without letting Windows replace races kill the run."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for attempt in range(retries + 1):
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.{attempt}.tmp")
+        try:
+            tmp.write_text(text, encoding="utf-8")
+            tmp.replace(path)
+            return True
+        except OSError:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if attempt < retries:
+                time.sleep(0.05)
+    return False
 
 
 def _latest_run_dir():
@@ -862,8 +881,10 @@ def _run_dir_from_ref(ref):
     if ref == "active":
         st = _read_json_file(_active_file(), {})
         rid = st.get("run_id")
-        if not rid:
-            raise ValueError("ACTIVE.json に active run がありません")
+        if st.get("state") != "active" or not rid:
+            raise ValueError(
+                "active な run がありません(最後の run は state=%s)。run id か latest を指定してください"
+                % st.get("state", "?"))
         return _runs_dir() / _safe_component(rid, "run_id")
     return _runs_dir() / ref
 
@@ -948,15 +969,10 @@ def update_operator_state(run, state, **extra):
         data["completed_at"] = _now()
     data.update(extra)
     data["counts"] = _steering_counts(run)
-    tmp = cd / f".state.{os.getpid()}.tmp"
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(cd / "state.json")
+    _replace_text_best_effort(cd / "state.json", json.dumps(data, ensure_ascii=False, indent=2))
     af = _active_file()
-    af.parent.mkdir(parents=True, exist_ok=True)
     active = {"run_id": run["id"], "state": state, "updated_at": _now(), "path": str(run["dir"])}
-    tmpa = af.with_name(f".ACTIVE.{os.getpid()}.tmp")
-    tmpa.write_text(json.dumps(active, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmpa.replace(af)
+    _replace_text_best_effort(af, json.dumps(active, ensure_ascii=False, indent=2))
 
 
 def _operator_note_text(text):
@@ -966,6 +982,7 @@ def _operator_note_text(text):
 
 
 def _next_note_id(rd):
+    # Best-effort human-facing id. Concurrent steer processes can collide, but JSONL append remains valid.
     nums = []
     for n in _steering_notes(rd):
         m = re.match(r"op-(\d+)$", str(n.get("id", "")))
@@ -1116,15 +1133,13 @@ def write_operator_control(run_or_dir):
             any_conf = True
     if not any_conf:
         md.append("| - | - | - | - |")
-    (cd / "operator_control.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    _replace_text_best_effort(cd / "operator_control.md", "\n".join(md) + "\n")
 
     st = _control_state(rd)
     if not st:
         st = {"run_id": rd.name, "state": "completed" if (rd / "REPORT.md").exists() else "unknown"}
     st.update({"updated_at": _now(), "counts": counts})
-    tmp = cd / f".state.{os.getpid()}.{threading.get_ident()}.tmp"
-    tmp.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(cd / "state.json")
+    _replace_text_best_effort(cd / "state.json", json.dumps(st, ensure_ascii=False, indent=2))
     return counts
 
 

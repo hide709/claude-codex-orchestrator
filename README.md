@@ -89,6 +89,8 @@ python orchestrate.py steer active --revoke op-001
 ```
 
 - scope: `global` / `generate` / `proximity` / `redteam` / `revise` / `verify` / `next_round`。
+- `active` は `runs/ACTIVE.json` の `state=active` のときだけ解決する。完了後の run へ追記する場合は
+  run id または `latest` を明示する。
 - `global` と stage scope は、受信後に該当する全 job へ sticky 適用され、`control/applied_notes.jsonl`
   に `(note_id × label)` の trace を残す。
 - `next_round` は現MVPでは LLM prompt に注入せず、`memory_suggestions.md` の `prefer` 候補として人間確認に回す。
