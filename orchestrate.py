@@ -1175,7 +1175,8 @@ def record_fallback(run, stage, label, candidate_id="", fallback_type="", effect
 
 
 def attach_candidate_fallback(c, rec):
-    item = {k: v for k, v in rec.items() if k not in ("ts", "label", "reason") or v}
+    item = {k: rec[k] for k in ("stage", "candidate_id", "fallback_type", "effect", "engine")
+            if rec.get(k)}
     c.setdefault("_fallbacks", []).append(item)
 
 
@@ -1797,7 +1798,7 @@ def verify(runner, cands, cfg, run, mem):
                 effect="verify failed; verdict=flag with all axes 未検証",
                 reason=e, engine=getattr(runner, "engine", cfg.get("engine", "?")))
             fb = {"verdict": "flag", "kill_reason": "",
-                  "notes": f"検証エラー(要再実行): {e}", "prior_art": [],
+                  "notes": f"検証エラー(要再実行): {_short_error(e)}", "prior_art": [],
                   "provenance": provenance(run, cfg, "verify", label, target=c["id"]),
                   "evidence_refs": evidence_refs(c),
                   "_fallback": rec}
