@@ -34,6 +34,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 PROMPTS_DIR = ROOT / "prompts"
+TEMPLATES_DIR = ROOT / "templates"
 MEMORY_DIR = ROOT / "memory"
 QUEUE_DIR = ROOT / "queue"
 
@@ -101,6 +102,21 @@ PROXIMITY_SCHEMA = _obj(
         "underexplored_axes": {"type": "array", "items": {"type": "string"}},
     },
     ["clusters", "underexplored_axes"],
+)
+
+RESEARCH_PRIORITY_SCHEMA = _obj(
+    {
+        "recommendations": {"type": "array", "items": _obj(
+            {
+                "id":     {"type": "string"},
+                "role":   {"type": "string"},
+                "reason": {"type": "string"},
+                "order":  {"type": "integer"},
+            },
+            ["id", "role", "reason", "order"])},
+        "note": {"type": "string"},
+    },
+    ["recommendations", "note"],
 )
 
 REVIEW_SCHEMA = _obj(
@@ -584,6 +600,19 @@ class MockRunner:
                                   "diversity_warning": "表現違いの同型（mock）"}],
                     "underexplored_axes": ["negative-control design（mock）",
                                            "toy-simulation-first（mock）"]}
+        if kind == "research_priority":
+            ids = []
+            for x in re.findall(r"\brq-\d+\b", prompt):
+                if x not in ids:
+                    ids.append(x)
+            if not ids:
+                ids = ["rq-00"]
+            return {"recommendations": [
+                {"id": cid, "role": "最初に読む候補" if i == 0 else "育てる候補(推奨)",
+                 "reason": "mock: 研究テーマとして整理しやすく、次の検証問いに落としやすい。",
+                 "order": i + 1}
+                for i, cid in enumerate(ids)
+            ], "note": "mock research priority"}
         if kind == "review":
             return {"attacks": [
                 {"type": "hidden_assumption", "claim": "前提Bが未明示（mock）。",
@@ -652,6 +681,22 @@ def render(template, **kw):
 
 def load_prompt(name):
     return (PROMPTS_DIR / f"{name}.md").read_text(encoding="utf-8")
+
+
+REPORT_TEMPLATE_FILES = ("report_summary.md", "candidate_onepager.md")
+
+
+def load_template(name):
+    p = TEMPLATES_DIR / name
+    try:
+        return p.read_text(encoding="utf-8")
+    except Exception as e:
+        raise SystemExit(f"report template を読めません: {p} ({e})")
+
+
+def validate_report_templates():
+    for name in REPORT_TEMPLATE_FILES:
+        load_template(name)
 
 
 # ----------------------------------------------------------------------------
@@ -1893,6 +1938,7 @@ def priority_for_next_round(survivors, axes, run):
                   "既存 artifact からの決定的計算(LLM 不使用)。"),
         "floor": "all survivors keep full standing; priority allocates EXTRA compute only",
         "rows": rows})
+    run["priority_rows"] = rows
     by_id = {r["id"]: r for r in rows}
     for c in survivors:
         c["_priority"] = by_id[c["id"]]["priority_for_next_round"]
@@ -1913,6 +1959,81 @@ def fallback_badge(c):
     if "verify" in stages:
         return "未検証(fallback: " + ", ".join(stages) + ")"
     return "劣化あり(fallback: " + ", ".join(stages) + ")"
+
+
+def candidate_status(c):
+    v = c.get("_verdict", {}) or {}
+    if v.get("_form_fail"):
+        base = "客観棄却(形式不備)"
+    elif c.get("_llm_kill"):
+        base = "kill?(LLM/要人間確認)"
+    else:
+        base = {"keep": "継続候補", "flag": "要注目(flag)"}.get(v.get("verdict"), v.get("verdict", "?"))
+    fb = fallback_badge(c)
+    return base if fb == "-" else f"{base} / {fb}"
+
+
+def _priority_rows(run):
+    rows = run.get("priority_rows")
+    if rows is not None:
+        return rows
+    p = run["dir"] / "priority.json"
+    if not p.exists():
+        return []
+    try:
+        rows = json.loads(p.read_text(encoding="utf-8")).get("rows", [])
+        run["priority_rows"] = rows
+        return rows
+    except Exception:
+        return []
+
+
+def _priority_by_id(run):
+    return {r.get("id"): r for r in _priority_rows(run)}
+
+
+PRIORITY_BREAKDOWN_LABEL = {
+    "uncertainty_low_axes": "根拠の弱い観点が多い",
+    "uncertainty_med_axes": "中程度の不確実性が残る",
+    "open_unknowns": "未解決の unknowns がある",
+    "flag_attention": "要注目(flag)の確認が必要",
+    "llm_kill_review": "LLM 棄却推奨の確認が必要",
+    "cluster_non_representative": "同方向の代表候補がある",
+    "past_duplicate": "過去 run と似ている",
+}
+
+
+def _priority_reason(row):
+    bd = row.get("breakdown") or {}
+    pos = [(k, v) for k, v in bd.items() if isinstance(v, (int, float)) and v > 0]
+    pos.sort(key=lambda kv: (-kv[1], kv[0]))
+    if not pos:
+        return "baseline 継続"
+    return " / ".join(PRIORITY_BREAKDOWN_LABEL.get(k, k) for k, _ in pos[:2])
+
+
+def _one_line(c, *keys, limit=180):
+    for k in keys:
+        v = c.get(k)
+        if isinstance(v, list):
+            v = "; ".join(str(x) for x in v)
+        if str(v or "").strip():
+            return _md_cell(v, limit)
+    return "-"
+
+
+def _onepager_markdown(template, c):
+    next_action = (f"{c.get('_priority','-')} → `{c.get('_next_action','-')}`"
+                   if "_priority" in c else "-")
+    return render(
+        template,
+        one_liner=_one_line(c, "question", "hypothesis", limit=220),
+        why_interesting=_one_line(c, "significance_if_true", "novelty_claim", limit=260),
+        first_kill=_one_line(c, "cheapest_kill", "falsification", limit=260),
+        if_falsified=_one_line(c, "failure_condition", "falsification", limit=260),
+        status=candidate_status(c),
+        next_action=next_action,
+    ).strip()
 
 
 def arbiter(survivors, run, axes=None, cfg=None):
@@ -2077,6 +2198,305 @@ def _provider_status(prov, d):
     return f"実施済み・ヒット {len(d.get('results', []))} 件(query: {_md_cell(d.get('query',''), 60)})"
 
 
+def _provider_from_prior_art(p):
+    text = " ".join(str(p.get(k, "")) for k in ("citation", "relation", "url")).lower()
+    if "ntrs" in text or "nasa" in text:
+        return "ntrs"
+    if "inspire" in text or "hep" in text:
+        return "inspire"
+    if "arxiv" in text or p.get("source_tier") == "preprint":
+        return "arxiv"
+    return "unknown"
+
+
+def _prior_art_provider_counts(cands):
+    counts = {"arxiv": 0, "inspire": 0, "ntrs": 0, "unknown": 0}
+    for c in cands:
+        for p in (c.get("_verdict") or {}).get("prior_art") or []:
+            counts[_provider_from_prior_art(p)] = counts.get(_provider_from_prior_art(p), 0) + 1
+    return counts
+
+
+def _verification_order_table(survivors, run):
+    rows = list(_priority_rows(run))
+    if not rows:
+        return "（priority.json がありません）"
+    by_id = {c["id"]: c for c in survivors}
+    md = ["| 順 | 候補 | 現時点の扱い | 次にやること | 配分点 | 理由 |",
+          "|---|---|---|---|---:|---|"]
+    for i, row in enumerate(rows, 1):
+        c = by_id.get(row.get("id"), {})
+        md.append("| " + " | ".join([
+            str(i),
+            _md_cell(row.get("id")),
+            _md_cell(candidate_status(c) if c else row.get("verdict", "-"), 80),
+            _md_cell(row.get("recommended_next_action", "-"), 120),
+            str(row.get("priority_for_next_round", "-")),
+            _md_cell(_priority_reason(row), 160),
+        ]) + " |")
+    return "\n".join(md)
+
+
+def _research_priority_section(run):
+    data = run.get("research_priority")
+    if not data:
+        return "（無効、または未生成）"
+    if data.get("error"):
+        return f"- 推奨生成に失敗: {_md_cell(data.get('error'), 180)}\n- `research_priority.json` を確認してください。"
+    recs = sorted(data.get("recommendations") or [], key=lambda r: (r.get("order", 999), r.get("id", "")))
+    if not recs:
+        return "（推奨は空でした。人間が `decision_matrix.md` と `candidate_reports.md` から判断してください）"
+    md = ["| 育てる順 | 候補 | 位置づけ | 理由 |",
+          "|---:|---|---|---|"]
+    for r in recs:
+        md.append("| " + " | ".join([
+            str(r.get("order", "-")),
+            _md_cell(r.get("id")),
+            _md_cell(r.get("role"), 140),
+            _md_cell(r.get("reason"), 260),
+        ]) + " |")
+    note = data.get("note")
+    if note:
+        md += ["", f"- メモ: {_md_cell(note, 260)}"]
+    md.append("- 正本: `research_priority.json`")
+    return "\n".join(md)
+
+
+def _first_actions(survivors, run):
+    rows = _priority_rows(run)
+    if not rows:
+        return "- `priority.json` が無いため未作成。"
+    by_id = {c["id"]: c for c in survivors}
+    md = []
+    for i, row in enumerate(rows[:3], 1):
+        c = by_id.get(row.get("id"), {})
+        md.append(f"{i}. **{row.get('id')}**: `{row.get('recommended_next_action', '-')}` — "
+                  f"{_md_cell(c.get('cheapest_kill', '最短確認は candidate_reports.md を参照'), 180)}")
+    return "\n".join(md) if md else "- 候補なし。"
+
+
+def _search_quality_section(run, cands, cfg, charter):
+    provider_names = {"arxiv": "arXiv", "inspire": "INSPIRE-HEP", "ntrs": "NASA NTRS"}
+    adopted = _prior_art_provider_counts(cands)
+    cfg_name = cfg.get("_config_path") or "(default)"
+    if cfg_name not in ("(default)", ""):
+        cfg_name = Path(cfg_name).name
+    md = [
+        f"- 使用 config: `{_md_cell(cfg_name, 120)}`",
+        f"- 文献・出典検索: {'有効' if charter.get('lit_search_enabled', True) else '無効'}",
+        "",
+        "| provider | 実施状況 | 実クエリ | ヒット数 | verifier 採用数 |",
+        "|---|---|---|---:|---:|",
+    ]
+    for prov in ("arxiv", "inspire", "ntrs"):
+        docs = []
+        for c in cands:
+            docs.append(_read_evidence_files(run, c["id"]).get(prov, {}))
+        existing = [d for d in docs if d]
+        enabled = sum(1 for d in existing if d.get("enabled"))
+        skipped = sum(1 for d in existing if d.get("skipped"))
+        errors = [d.get("error") for d in existing if d.get("error")]
+        hits = sum(len(d.get("results") or []) for d in existing)
+        queries = []
+        for d in existing:
+            q = str(d.get("query") or "").strip()
+            if q and q not in queries:
+                queries.append(q)
+        if not existing:
+            status = "artifactなし"
+        elif errors:
+            status = f"エラー {len(errors)} 件 / 実施 {enabled}/{len(existing)}"
+        elif enabled:
+            status = f"実施 {enabled}/{len(existing)}"
+        elif skipped:
+            status = f"スキップ {skipped}/{len(existing)}"
+        else:
+            status = "無効"
+        adopted_n = adopted.get(prov, 0) if enabled else 0
+        qtxt = " / ".join(_md_cell(q, 80) for q in queries[:2]) or "-"
+        if len(queries) > 2:
+            qtxt += f" / 他 {len(queries) - 2} 件"
+        md.append("| " + " | ".join([
+            provider_names[prov],
+            _md_cell(status, 80),
+            qtxt,
+            str(hits),
+            str(adopted_n),
+        ]) + " |")
+    if adopted.get("unknown"):
+        md.append(f"\n- provider を決定できない verifier 採用文献: {adopted['unknown']} 件"
+                  "（source_tier は保持、provider 推定はしない）")
+    return "\n".join(md)
+
+
+def _warnings_section(run, all_cands):
+    lines = []
+    fbs = fallback_records(run)
+    if fbs:
+        by_stage = {}
+        for f in fbs:
+            by_stage[f.get("stage", "?")] = by_stage.get(f.get("stage", "?"), 0) + 1
+        affected = sorted({f.get("candidate_id") for f in fbs if f.get("candidate_id")})
+        lines += [
+            f"- fallback / 継続処理: {len(fbs)} job",
+            f"- stage別: {', '.join(f'{k}:{v}' for k, v in sorted(by_stage.items()))}",
+            f"- 影響候補: {', '.join(affected) if affected else '(候補生成前/候補なし)'}",
+            "- 詳細: `fallbacks.json` / `events.jsonl`",
+        ]
+    else:
+        lines.append("- fallback なし。")
+
+    steer = _steering_counts(run)
+    lines.append("- operator steering: "
+                 f"received {steer['received']} / applied {steer['applied_events']} / "
+                 f"pending {steer['pending']} / next_round {steer['next_round']} / "
+                 f"conflicted {steer['conflicted']} / revoked {steer['revoked']}")
+    lines.append("- steering は注意を向けるための情報で、evidence ではありません。")
+
+    dups = [c for c in all_cands if c.get("_near_dup")]
+    if dups:
+        lines.append("- 過去 run との類似候補:")
+        for c in dups:
+            lines.append(f"  - {c['id']}: {c['_near_dup']['run']}/{c['_near_dup']['id']} "
+                         f"(bigram {c['_near_dup']['score']})")
+    prox = run.get("proximity") or {}
+    clusters = prox.get("clusters") or []
+    if clusters:
+        lines.append("- within-run proximity:")
+        for cl in clusters:
+            members = ", ".join(cl.get("members") or [])
+            rep = f" / 代表 {cl.get('representative')}" if cl.get("representative") else ""
+            warn = f" / {cl.get('diversity_warning')}" if cl.get("diversity_warning") else ""
+            lines.append(f"  - {cl.get('cluster_id')}: {cl.get('theme') or '-'} ({members}){rep}{warn}")
+    if prox.get("underexplored_axes"):
+        lines.append("- 未探索軸: " + ", ".join(prox["underexplored_axes"]))
+    return "\n".join(lines)
+
+
+def _links_section():
+    return "\n".join([
+        "- `candidate_reports.md`: 候補ごとの要約、詳細、反証・ツッコミ、出典",
+        "- `decision_matrix.md`: 評価軸ごとの整理。勝者は選びません",
+        "- `priority.json`: 次に検証する順番の正本",
+        "- `research_priority.json`: 育てる順の LLM 推奨。採用判定ではありません",
+        "- `evidence/*.json`: 文献・出典検索の生 artifact",
+        "- `hypothesis_graph.{json,md}`: lineage",
+        "- `memory_suggestions.md`: 記録候補の提案のみ",
+    ])
+
+
+def _memory_suggestions_section(run):
+    n = run.get("memory_suggestions_n")
+    if n is None:
+        return "（未生成）"
+    return f"- {n} 件 → `memory_suggestions.md`（提案のみ。コマンド実行が承認）"
+
+
+BANNED_RESEARCH_PRIORITY = {
+    "winner": "推奨候補",
+    "best": "推奨",
+    "truth_score": "評価メモ",
+    "final_rank": "読む順",
+    "本命": "最初に読む候補",
+}
+
+
+def _scrub_research_priority_text(text):
+    out = str(text or "")
+    for bad, good in BANNED_RESEARCH_PRIORITY.items():
+        out = re.sub(re.escape(bad), good, out, flags=re.IGNORECASE)
+    return _SECRET_RE.sub("[REDACTED]", out)
+
+
+def _next_round_notes_text(run):
+    notes = _steering_notes(run)
+    revoked = {n.get("revokes") for n in notes if n.get("type") == "revoke" and n.get("status") != "conflicted"}
+    active = [n for n in notes if _note_is_active(n, revoked) and n.get("scope") == "next_round"]
+    if not active:
+        return "(なし)"
+    return "\n".join(f"- {n.get('id')}: {n.get('note')}" for n in active)
+
+
+def research_priority(runner, charter, survivors, cfg, run):
+    """Issue #61: 研究として育てる順を LLM 推奨・要確認として出す。
+    decision_matrix / hard gate / evidence level には混ぜない。失敗しても run は完走する。"""
+    if not cfg.get("grow_priority_enabled", True):
+        data = {"recommendations": [], "note": "grow_priority_enabled=false", "disabled": True,
+                "provenance": provenance(run, cfg, "research_priority", "disabled")}
+        write_json(run, "research_priority.json", data)
+        run["research_priority"] = data
+        return data
+
+    rows = _priority_by_id(run)
+    payload = []
+    for c in survivors:
+        v = c.get("_verdict") or {}
+        payload.append({
+            "id": c["id"],
+            "question": c.get("question", ""),
+            "hypothesis": c.get("hypothesis", ""),
+            "significance_if_true": c.get("significance_if_true", ""),
+            "cheapest_kill": c.get("cheapest_kill", ""),
+            "failure_condition": c.get("failure_condition", ""),
+            "status": candidate_status(c),
+            "priority_for_next_round": rows.get(c["id"], {}),
+            "verdict_summary": {
+                ax: {"assessment": (v.get(ax) or {}).get("assessment", ""),
+                     "confidence": (v.get(ax) or {}).get("confidence", "")}
+                for ax in charter["eval_axes"]
+            },
+            "prior_art_count": len(v.get("prior_art") or []),
+        })
+    label = f"{run['id']}__research_priority"
+    tmpl = load_prompt("research_priority")
+    prompt = render(tmpl,
+                    candidates=json.dumps(payload, ensure_ascii=False, indent=2),
+                    next_round_notes=_next_round_notes_text(run),
+                    schema=json.dumps(RESEARCH_PRIORITY_SCHEMA, ensure_ascii=False))
+    prompt = apply_steering(prompt, run, "next_round", label, "research_priority",
+                            engine=getattr(runner, "engine", cfg.get("engine", "?")))
+    try:
+        raw = runner.run(prompt, RESEARCH_PRIORITY_SCHEMA, "research_priority", label, run["log"])
+        allowed = {c["id"] for c in survivors}
+        recs = []
+        for i, rec in enumerate(raw.get("recommendations") or [], 1):
+            cid = str(rec.get("id", ""))
+            if cid not in allowed:
+                continue
+            try:
+                order = int(rec.get("order", i))
+            except Exception:
+                order = i
+            recs.append({"id": cid,
+                         "role": _scrub_research_priority_text(rec.get("role")),
+                         "reason": _scrub_research_priority_text(rec.get("reason")),
+                         "order": order})
+        recs.sort(key=lambda r: (r["order"], r["id"]))
+        for i, rec in enumerate(recs, 1):
+            rec["order"] = i
+        data = {"recommendations": recs,
+                "note": _scrub_research_priority_text(raw.get("note")),
+                "label": "LLM 推奨・要確認。採用判定ではない。",
+                "provenance": {**provenance(run, cfg, "research_priority", label),
+                               "input_artifacts": ["candidates/*.json", "verdicts/*.json", "priority.json",
+                                                   "control/operator_notes.jsonl"],
+                               "next_round_notes": _next_round_notes_text(run)}}
+    except Exception as e:
+        log(run, f"  [research_priority] FAILED: {e}")
+        data = {"recommendations": [],
+                "note": "推奨生成に失敗。verdict 等から人間が判断してください。",
+                "label": "LLM 推奨・要確認。採用判定ではない。",
+                "error": _short_error(e),
+                "provenance": {**provenance(run, cfg, "research_priority", label),
+                               "input_artifacts": ["candidates/*.json", "verdicts/*.json", "priority.json",
+                                                   "control/operator_notes.jsonl"],
+                               "next_round_notes": _next_round_notes_text(run)}}
+    write_json(run, "research_priority.json", data)
+    run["research_priority"] = data
+    log(run, f"  research_priority: {len(data.get('recommendations') or [])} 件を出力(LLM 推奨・要確認)")
+    return data
+
+
 def write_candidate_reports(charter, cands, run, cfg):
     """候補ごとの詳細・評価・出典を1つの Markdown に集約(Issue #47)。
     JSON artifact が正本で、これは人間向け view。内部キーは括弧で併記(用語対応表は末尾)。
@@ -2085,17 +2505,10 @@ def write_candidate_reports(charter, cands, run, cfg):
     axes = charter["eval_axes"]
     lab = {ax: axis_label(ax, cfg) for ax in axes}
     show_fallback = any(candidate_fallbacks(c) for c in cands)
+    onepager_template = load_template("candidate_onepager.md")
 
     def status_of(c):
-        v = c.get("_verdict", {}) or {}
-        if v.get("_form_fail"):
-            base = "客観棄却(形式不備)"
-        elif c.get("_llm_kill"):
-            base = "kill?(LLM/要人間確認)"
-        else:
-            base = {"keep": "継続候補", "flag": "要注目(flag)"}.get(v.get("verdict"), v.get("verdict", "?"))
-        fb = fallback_badge(c)
-        return base if fb == "-" else f"{base} / {fb}"
+        return candidate_status(c)
 
     def fallback_summary(c):
         fs = candidate_fallbacks(c)
@@ -2176,6 +2589,8 @@ def write_candidate_reports(charter, cands, run, cfg):
         lin = c.get("_lineage", {}) or {}
         md += [f"---\n\n## {cid}: {_md_cell(c.get('question',''), 120)}\n",
                f"**状態: {status_of(c)}**\n",
+               _onepager_markdown(onepager_template, c),
+               "",
                *fallback_rows(c),
                "### 1. 案の内容",
                "| 項目 | 内容 |", "|---|---|",
@@ -2372,7 +2787,7 @@ def write_memory_suggestions(charter, cands, survivors, run, cfg):
         note_text = n.get("note", "")
         add("operator_steering", "memory/preferences.md",
             f"次 run に持ち越す operator steering: {note_text[:120]}",
-            "next_round scope の note は現MVPではLLM jobへ直接注入せず、次 run の seed/preference 候補として人間確認に回す。",
+            "next_round scope の note は research_priority では参考入力になるが evidence ではない。次 run の seed/preference 候補としても人間確認に回す。",
             ["control/operator_notes.jsonl"],
             f"python orchestrate.py prefer {_ps_quote(note_text, 240)}")
 
@@ -2410,80 +2825,48 @@ def write_unresolved(cands, run):
     write_text(run, "unresolved.md", "\n".join(lines))
 
 
-def report(charter, survivors, all_cands, run):
+def report(charter, survivors, all_cands, run, cfg):
     _eng = {}
     for c in all_cands:
         _eng[c.get("_engine", "?")] = _eng.get(c.get("_engine", "?"), 0) + 1
     eng_bd = ", ".join(f"{k}:{v}" for k, v in sorted(_eng.items())) or "-"
-    steer = _steering_counts(run)
     write_fallbacks(run)
-    fbs = fallback_records(run)
-    fb_by_stage = {}
-    for f in fbs:
-        fb_by_stage[f.get("stage", "?")] = fb_by_stage.get(f.get("stage", "?"), 0) + 1
-    fb_affected = sorted({f.get("candidate_id") for f in fbs if f.get("candidate_id")})
-    fb_summary = ", ".join(f"{k}:{v}" for k, v in sorted(fb_by_stage.items())) or "-"
-    md = [f"# RUN REPORT — {run['id']}\n",
-          f"- seed: **{charter['seed']}**",
-          f"- constraints: {charter['constraints'] or '(なし)'}",
-          *([f"- domain: {charter['domain']}"] if charter.get("domain") else []),
-          f"- engine: {run['engine']} / model: {run['model']}  (生成 engine 内訳: {eng_bd})",
-          f"- 生成 {len(all_cands)} / 生存 {len(survivors)} / 客観棄却 {len(all_cands)-len(survivors)}"
-          + (f" / 内 LLM-kill推奨 {sum(1 for c in survivors if c.get('_llm_kill'))}(要人間確認)"
-             if any(c.get('_llm_kill') for c in survivors) else ""),
-          f"- created: {run['created']}\n",
-          *(["## ⚠ fallbackによる静かな劣化",
-             f"- この run は **{len(fbs)} job** が失敗し、fallback / 継続処理で完走しています。",
-             f"- stage別: {fb_summary}",
-             f"- 影響候補: {', '.join(fb_affected) if fb_affected else '(候補生成前/候補なし)'}",
-             "- `decision_matrix.md` と `candidate_reports.md` の `fallback警告` を確認してください。",
-             "- 生データ: `fallbacks.json` / `events.jsonl`\n"]
-            if fbs else []),
-          "## Operator Steering",
-          "- human steering notes guide attention only; they are **not evidence** and do not override charter/verifier output.",
-          f"- received: {steer['received']} / applied events: {steer['applied_events']} / "
-          f"pending: {steer['pending']} / next_round: {steer['next_round']} / "
-          f"conflicted: {steer['conflicted']} / revoked: {steer['revoked']}",
-          "- trace: `control/operator_control.md` / raw: `control/operator_notes.jsonl`, `control/applied_notes.jsonl`\n",
-          *(["## ⚠ 過去 run との重複注意(検知のみ・棄却ではない)",
-             *[f"- {c['id']}: 過去 {c['_near_dup']['run']}/{c['_near_dup']['id']} と類似 "
-               f"(bigram {c['_near_dup']['score']})" for c in all_cands if c.get('_near_dup')], ""]
-            if any(c.get('_near_dup') for c in all_cands) else []),
-          *(["## 多様性(within-run proximity / 注釈のみ・棄却しない)",
-             *[f"- {cl['cluster_id']}『{cl.get('theme') or '-'}』: {', '.join(cl['members'])}"
-               + (f" / 代表 {cl['representative']}" if len(cl['members']) > 1 else "")
-               + (f" / ⚠ {cl['diversity_warning']}" if cl.get('diversity_warning') else "")
-               for cl in run.get("proximity", {}).get("clusters", [])],
-             *([f"- 未探索軸(次 run の種候補): {', '.join(run['proximity']['underexplored_axes'])}"]
-               if run.get("proximity", {}).get("underexplored_axes") else []), ""]
-            if run.get("proximity") else []),
-          "## 読み方",
-          "1. `decision_matrix.md` … 生存候補を評価軸ごとに(単一スコアに潰さず)一覧。",
-          "2. `candidate_reports.md` … **候補ごとの詳細・評価・出典の人間向けレポート**(#47。まずこれを読む)。",
-          "3. `candidates/*.json` … 各 Research Hypothesis Contract。",
-          "4. `reviews/*.json` … red-team の攻撃(検証項目へ変換済み)。",
-          "5. `revised/*.json` … red-team 後の改訂版。原案は `candidates/` に残る。",
-          "6. `evidence/*.json` … arXiv(preprint)/INSPIRE-HEP/NASA NTRS(権威DB)から機械的に収集した検証補助データ。",
-          "7. `verdicts/*.json` … Tier0 検証結果(novelty/soundness/feasibility + prior_art)。",
-          "8. `proximity.json` … within-run の重複クラスタ・多様性・未探索軸(#34。注釈のみ)。",
-          "9. `hypothesis_graph.{json,md}` … 仮説の lineage(seed→生成→攻撃→改訂→検証 / #35)。",
-          "10. `priority.json` … 次ラウンドの追加検証予算の配分指針(#37。**採用判定ではない**・内訳付き)。",
-          "11. `discarded.md` … hard gate 落ち(理由付き)。 `unresolved.md` … 未解決・未追跡変種。",
-          "",
-          "## 次の一手(人間)",
-          "- 生存案のうち `cheapest_kill` が安いものから Tier1(toy計算/既存データ再解析)に回す。",
-          "- matrix の `next_round(配分)` / `priority.json` は追加検証の配分指針(採用判定ではない)。"
-          "不確実性の高い軸から潰すのに使う。",
-          "- prior_art の source_tier が低い novelty 判定は、権威DB(INSPIRE等)で裏取りする。",
-          "- flag(通説違反など)は消さず、面白い線として別途検討。",
-          "- `kill?(LLM/要確認)` は LLM の棄却理由が客観的に正しいか人間が確認(誤kill救済)。",
-          "- 採用/却下を memory に記録 → 次回生成へ反映: "
-          "`python orchestrate.py promote <run> <id>` / `reject <run> <id> --note \"理由\"` / `prefer \"好み\"`",
-          *([f"\n**Memory suggestions: {run['memory_suggestions_n']} 件** → "
-             "`memory_suggestions.md`(提案のみ・コマンド実行=承認 / #48)"]
-            if run.get("memory_suggestions_n") is not None else []),   # 0 件でも明示(acceptance)
-          ""]
-    write_text(run, "REPORT.md", "\n".join(md))
+    first_row = next(iter(_priority_rows(run)), {})
+    first_id = first_row.get("id")
+    grow_recs = (run.get("research_priority") or {}).get("recommendations") or []
+    grow_first = sorted(grow_recs, key=lambda r: (r.get("order", 999), r.get("id", "")))[0] if grow_recs else None
+    conclusion = [
+        f"- seed: **{charter['seed']}**",
+        f"- constraints: {charter['constraints'] or '(なし)'}",
+        *([f"- domain: {charter['domain']}"] if charter.get("domain") else []),
+        f"- engine: {run['engine']} / model: {run['model']}（生成 engine 内訳: {eng_bd}）",
+        f"- 生成 {len(all_cands)} / 生存 {len(survivors)} / 客観棄却 {len(all_cands)-len(survivors)}"
+        + (f" / LLM 棄却推奨 {sum(1 for c in survivors if c.get('_llm_kill'))} 件(要人間確認)"
+           if any(c.get("_llm_kill") for c in survivors) else ""),
+        f"- created: {run['created']}",
+    ]
+    if grow_first:
+        conclusion.append(f"- 最初に読む候補(LLM 推奨・要確認): **{grow_first.get('id')}** — "
+                          f"{_md_cell(grow_first.get('role'), 120)}。採用判定ではありません。")
+    elif first_id:
+        conclusion.append(f"- 次に検証する候補(決定的配分): **{first_id}** — "
+                          f"`{first_row.get('recommended_next_action', '-')}`。採用判定ではありません。")
+    else:
+        conclusion.append("- 生存候補が無いため、人間は `discarded.md` と `run.log` を確認してください。")
+
+    text = render(
+        load_template("report_summary.md"),
+        run_id=run["id"],
+        conclusion="\n".join(conclusion),
+        verification_order_table=_verification_order_table(survivors, run),
+        research_priority_section=_research_priority_section(run),
+        first_actions=_first_actions(survivors, run),
+        search_quality=_search_quality_section(run, all_cands, cfg, charter),
+        warnings=_warnings_section(run, all_cands),
+        links=_links_section(),
+        memory_suggestions=_memory_suggestions_section(run),
+    )
+    write_text(run, "REPORT.md", text)
 
 
 # ----------------------------------------------------------------------------
@@ -2544,6 +2927,7 @@ DEFAULT_CFG = {
     "proximity_enabled": True,        # within-run 重複検知・多様性(#34。注釈のみ)
     "proximity_llm_enabled": True,    # クラスタの theme/警告/未探索軸ラベル(失敗しても決定的注釈は残る)
     "proximity_sim_threshold": 0.45,  # char-bigram Jaccard のクラスタ閾値(cross-run 検知は 0.5)
+    "grow_priority_enabled": True,    # Issue #61: 育てる順(LLM 推奨・要確認)。採用判定には使わない
     "lit_search_enabled": True, "lit_search_max_terms": 6,
     "lit_search_max_results": 5, "lit_search_timeout_sec": 15,
     "inspire_enabled": True,   # inspire_mode(always|trigger|off)未指定時はここから導出
@@ -2622,8 +3006,10 @@ def main():
                          if args.seed_file else None)
     if not seed:
         ap.error("--seed か --seed-file が必要です")
+    validate_report_templates()
 
     cfg = load_cfg(args.config)
+    cfg["_config_path"] = str(Path(args.config).resolve()) if args.config else "(default)"
     if args.budget or cfg.get("budget_profile"):
         apply_budget_profile(cfg, args.budget or cfg["budget_profile"])
     if args.engine:
@@ -2688,12 +3074,13 @@ def main():
         priority_for_next_round(survivors, charter["eval_axes"], run)   # 配分指針(#37)。採用判定ではない
         log(run, "[8/8] ARBITER  — 整理(勝者は選ばない)")
         arbiter(survivors, run, charter["eval_axes"], cfg)
+        research_priority(runner, charter, survivors, cfg, run)          # LLM 推奨・要確認(#61)。matrix には混ぜない
         build_hypothesis_graph(cands, run)          # lineage を graph artifact に集約(#35)
         write_candidate_reports(charter, cands, run, cfg)   # 候補別詳細レポート(#47)
         write_memory_suggestions(charter, cands, survivors, run, cfg)   # 記録候補の提案(#48・保存しない)
         write_unresolved(cands, run)
         write_operator_control(run)                         # operator steering trace(#53)
-        report(charter, survivors, cands, run)
+        report(charter, survivors, cands, run, cfg)
         append_seen(run, cands)                     # 自動メモリ(重複検知用)に追記
         write_text(run, "run.log", "\n".join(run["_logbuf"]))
         success = True
