@@ -718,7 +718,7 @@ def _cross_engine_for_candidate(c, engines):
         for eng in engines:
             if eng != author:
                 return eng
-    return _engine_by_index(c, engines)
+    return engines[(_candidate_index(c) + 1) % len(engines)]
 
 
 def _alternate_engine(engine, engines):
@@ -1344,11 +1344,12 @@ def _attempt_errors(attempts):
 
 
 def run_llm_job_with_retry(stage, kind, label, prompt, schema, run, cfg, engines, engine,
-                           candidate_id=""):
+                           candidate_id="", author_engine=""):
     """Run one LLM job on the selected engine, then retry once on the alternate engine.
 
-    A successful retry is recorded in fallbacks.json for auditability, but marked
-    degraded=false because the stage still produced a proper LLM output.
+    A successful retry is recorded in fallbacks.json for auditability. Retry is
+    normally non-degraded, except when redteam/verify falls back to the author
+    engine and therefore loses cross-engine review independence.
     """
     engines = _dedupe(engines)
     primary = _base_engine(engine) or (engines[0] if engines else cfg.get("engine", "mock"))
@@ -1362,11 +1363,19 @@ def run_llm_job_with_retry(stage, kind, label, prompt, schema, run, cfg, engines
             data = make_runner_for(eng, cfg).run(prompt, schema, kind, used_label, run["log"])
             if idx > 0:
                 first = attempts[0]
-                record_fallback(
+                author_base = _base_engine(author_engine)
+                self_review_retry = stage in ("redteam", "verify") and author_base and eng == author_base
+                effect = f"{first['engine']} failed; {eng} retry produced a valid {kind} output"
+                if self_review_retry:
+                    effect += "; retry landed on the author engine, so cross-engine independence was lost"
+                rec = record_fallback(
                     run, stage, used_label, candidate_id=candidate_id,
                     fallback_type="engine_retry_succeeded",
-                    effect=f"{first['engine']} failed; {eng} retry produced a valid {kind} output",
-                    reason=first["error"], engine=f"{first['engine']}->{eng}", degraded=False)
+                    effect=effect,
+                    reason=first["error"], engine=f"{first['engine']}->{eng}",
+                    degraded=self_review_retry)
+                if self_review_retry and isinstance(data, dict):
+                    data["_fallback"] = rec
             return data, eng, used_label, attempts
         except Exception as e:
             attempts.append({"engine": eng, "label": used_label, "error": e})
@@ -1588,6 +1597,8 @@ def proximity(cands, charter, cfg, run):
                 effect="proximity LLM labeling failed; deterministic clusters continued",
                 reason=_attempt_errors(attempts), engine=_attempt_chain(attempts))
             data["_fallback"] = rec
+            data["provenance"] = provenance(run, cfg, "proximity", label,
+                                            engine=_attempt_chain(attempts), stage_engine=eng)
 
     for cl in clusters:
         for m in cl["members"]:
@@ -1615,6 +1626,7 @@ def redteam(cands, charter, cfg, run):
     def one(c):
         label = f"{run['id']}__review_{c['id']}"
         eng = _cross_engine_for_candidate(c, engines)
+        author = _author_engine(c, engines) or "?"
         # blind: 著者(レンズ)情報は渡さない
         shown = {k: v for k, v in c.items()
                  if not k.startswith("_") and k not in ("id", "provenance")}
@@ -1624,11 +1636,11 @@ def redteam(cands, charter, cfg, run):
         prompt = apply_steering(prompt, run, "redteam", label, "review", engine=eng)
         data, used_engine, used_label, attempts = run_llm_job_with_retry(
             "redteam", "review", label, prompt, REVIEW_SCHEMA, run, cfg, engines, eng,
-            candidate_id=c["id"])
+            candidate_id=c["id"], author_engine=author)
         if data is not None:
             data["provenance"] = provenance(run, cfg, "redteam", used_label, target=c["id"],
                                             engine=used_engine,
-                                            author_engine=_author_engine(c, engines) or "?")
+                                            author_engine=author)
             return c["id"], data
         log(run, f"  [review {c['id']}] FAILED: {_attempt_errors(attempts)}")
         rec = record_fallback(
@@ -1639,7 +1651,7 @@ def redteam(cands, charter, cfg, run):
         return c["id"], {"attacks": [], "_fallback": rec,
                          "provenance": provenance(run, cfg, "redteam", label, target=c["id"],
                                                   engine=_attempt_chain(attempts),
-                                                  author_engine=_author_engine(c, engines) or "?")}
+                                                  author_engine=author)}
 
     results = dict(_parallel(cfg, [(one, (c,)) for c in cands]))
     variants = []        # stronger_variant: 未追跡として未解決へ
@@ -1969,13 +1981,14 @@ def verify(cands, charter, cfg, run, mem):
     def one(c):
         label = f"{run['id']}__verify_{c['id']}"
         eng = _cross_engine_for_candidate(c, engines)
+        author = _author_engine(c, engines) or "?"
         miss = form_ok(c)
         if miss:
             return c["id"], {"_form_fail": miss, "verdict": "kill",
                              "kill_reason": f"形不備(必須欠落): {', '.join(miss)}",
                              "provenance": provenance(run, cfg, "verify", label, target=c["id"],
                                                       engine="deterministic-form-check",
-                                                      author_engine=_author_engine(c, engines) or "?")}
+                                                      author_engine=author)}
         prior_art_hint = collect_evidence(c, cfg, run)
         todo_items = list(c.get("_verify_todo", []))
         _rej = memory_reject_hint(mem)
@@ -1991,11 +2004,11 @@ def verify(cands, charter, cfg, run, mem):
         prompt = apply_steering(prompt, run, "verify", label, "verdict", engine=eng)
         verdict, used_engine, used_label, attempts = run_llm_job_with_retry(
             "verify", "verdict", label, prompt, vschema, run, cfg, engines, eng,
-            candidate_id=c["id"])
+            candidate_id=c["id"], author_engine=author)
         if verdict is not None:
             verdict["provenance"] = provenance(run, cfg, "verify", used_label, target=c["id"],
                                                engine=used_engine,
-                                               author_engine=_author_engine(c, engines) or "?")
+                                               author_engine=author)
             verdict["evidence_refs"] = evidence_refs(c)
             return c["id"], verdict
         else:
@@ -2009,7 +2022,7 @@ def verify(cands, charter, cfg, run, mem):
                   "notes": f"検証エラー(要再実行): {_attempt_errors(attempts)}", "prior_art": [],
                   "provenance": provenance(run, cfg, "verify", label, target=c["id"],
                                            engine=_attempt_chain(attempts),
-                                           author_engine=_author_engine(c, engines) or "?"),
+                                           author_engine=author),
                   "evidence_refs": evidence_refs(c),
                   "_fallback": rec}
             for ax in axes:
@@ -2516,7 +2529,7 @@ def _warnings_section(run, all_cands):
             f"- 影響候補: {', '.join(affected) if affected else '(候補生成前/候補なし)'}",
             "- 詳細: `fallbacks.json` / `events.jsonl`",
         ]
-    elif retry_only:
+    if retry_only:
         by_stage = {}
         for f in retry_only:
             by_stage[f.get("stage", "?")] = by_stage.get(f.get("stage", "?"), 0) + 1
@@ -2525,7 +2538,7 @@ def _warnings_section(run, all_cands):
             f"- stage別: {', '.join(f'{k}:{v}' for k, v in sorted(by_stage.items()))}",
             "- 詳細: `fallbacks.json` / `events.jsonl`",
         ]
-    else:
+    if not degraded and not retry_only:
         lines.append("- fallback なし。")
 
     steer = _steering_counts(run)
@@ -2957,10 +2970,11 @@ def write_memory_suggestions(charter, cands, survivors, run, cfg):
             [f"類似元 run: {', '.join(runs_hit[:3])}"],
             "python orchestrate.py prefer '<この方向を深める / 避ける 等の方針>'")
     # 4) engine 失敗の反復(≥2回)→ failure_pattern(issue 化候補)。ログ文字列でなく明示カウンタ(#55)を見る。
-    fails = degraded_fallback_records(run)
+    fails = fallback_records(run)
     if len(fails) >= 2:
+        degraded_n = len([f for f in fails if f.get("degraded", True)])
         add("failure_pattern", "issue",
-            f"engine 失敗/フォールバックが {len(fails)} 回発生",
+            f"engine 失敗/フォールバックが {len(fails)} 回発生(うち出力劣化 {degraded_n} 回)",
             "反復する失敗は run 固有でなく構造的な可能性。issue 化して原因(timeout/セッション/プロンプト)を追う。",
             ["fallbacks.json", "run.log"],
             f"gh issue create --label bug --title {_ps_quote(f'engine 失敗の反復(run {rid})')} "
@@ -3045,7 +3059,8 @@ def report(charter, survivors, all_cands, run, cfg):
     ]
     if degraded_fbs:
         conclusion.insert(0, f"- ⚠ **この run は {len(degraded_fbs)} job が失敗し fallback で継続** — "
-                             "red-team/verify が欠けた候補があります(詳細: ## 注意 / `fallbacks.json`)")
+                             "red-team/verify が欠けた、または生成 engine による self-review になった候補があります"
+                             "(詳細: ## 注意 / `fallbacks.json`)")
     elif fbs:
         conclusion.insert(0, f"- engine retry: {len(fbs)} job が別 engine の再試行で成功(候補出力の劣化なし)。")
     if grow_first:

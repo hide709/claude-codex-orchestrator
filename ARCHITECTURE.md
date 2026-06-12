@@ -90,10 +90,14 @@ Planner -> Generate(engine x 発想レンズ) -> Proximity -> Red-team -> Revise
      ├─ 形不備のみ → `discarded.md`
      ▼
 ┌──────────────┐
-│ ARBITER      │  勝者を選ばず、人間が判断しやすい表とレポートに整理
+│ ARBITER      │  決定的 Python。勝者を選ばず、人間が判断しやすい表に整理
 └────┬─────────┘
      ▼
-`decision_matrix.*` / `priority.json` / `research_priority.json`
+`decision_matrix.*` / `priority.json`
+     │
+     ├─ optional LLM: RESEARCH PRIORITY REVIEWER
+     │      → `research_priority.json`(LLM 推奨・要確認。採用判定ではない)
+     ▼
 `REPORT.md` / `candidate_reports.md` / `memory_suggestions.*`
      ▼
 ┌─────────┐
@@ -200,11 +204,11 @@ Planner -> Generate(engine x 発想レンズ) -> Proximity -> Red-team -> Revise
 - **落選の扱い:** 消さずに **捨て案台帳** に保存(理由付き)。
 
 ### 3.7 ARBITER
-- **責務:** gate 通過後に残った候補を**横断整理**する。idea段階では勝者や採用候補リストを選ばない。
-  - 現行 IDEA-stage: `decision_matrix.*`、`priority.json`、`research_priority.json`、`REPORT.md`、`candidate_reports.md` を作って人間に提示。
+- **責務:** gate 通過後に残った候補を**横断整理**する。idea段階では勝者や採用候補リストを選ばない。現行の `arbiter()` は LLM を呼ばない決定的 Python 処理。
+  - 現行 IDEA-stage: `decision_matrix.*`、`priority.json`、`REPORT.md`、`candidate_reports.md` を作って人間に提示。
   - 将来 PATCH-stage(future #21): **rule-based**(hard gate + 重み付き soft score の決定的スコアラ)。合成したら **再 VERIFIER** にかける。
 - **入力:** 残った候補 + `verdicts/*.json` + `evidence/*.json`。
-- **出力:** `decision_matrix.*` + `priority.json` + `research_priority.json` + 人間向け report。
+- **出力:** `decision_matrix.*` + `priority.json` + 人間向け report。
 - **禁止:**
   - **idea段階で勝者を選ばない**(客観指標が無い所で LLM に裁かせると §0 が壊れる)。
   - **soft score を単一値に潰さない**(matrix のまま人間へ)。
@@ -214,7 +218,7 @@ Planner -> Generate(engine x 発想レンズ) -> Proximity -> Red-team -> Revise
   重複)から**決定的に**計算したもの(LLM 不使用)。採用/棄却には使わない。**floor 保証**: 低 priority でも
   棄却されず baseline 検証は全員が受け続ける(de-facto kill の禁止)。AI debate / pairwise を信号に使う場合も
   argument_trace(#36)として evidence と分離し、opt-in とする。
-- **research_priority の engine 割当(#59):** `research_priority.json` を作る LLM job は候補集合全体を見るため `stage_engine.research_priority` で指定できる。空文字なら secondary engine。
+- **Research Priority Reviewer(#61/#59):** `research_priority.json` を作る optional LLM job。Arbiter の採用判断ではなく、研究として育てる順の LLM 推奨・要確認メモ。候補集合全体を見るため `stage_engine.research_priority` で指定でき、空文字なら secondary engine。
 
 ### 3.8 ARTIFACT BUS
 - **責務:** 全コンポーネント間の受け渡しをファイルで行う(YAML/MD/JSON/diff)。
@@ -433,7 +437,7 @@ attacks:
 5. 攻撃を受けて候補を **1回だけ revise** する(原案は保存)。
 6. **VERIFIER** が Tier 0 を実行: 形式、文献候補、筋の良さ、実行しやすさを確認。dual では生成 engine と別 engine に割り当てる。
 7. **HARD GATE** は形不備など客観的な不備だけを自動棄却する。LLM の kill は `kill?(LLM/要確認)` として残す。
-8. **ARBITER** が `decision_matrix.*`, `priority.json`, `research_priority.json`, `REPORT.md`, `candidate_reports.md` に整理する。
+8. **ARBITER** が `decision_matrix.*`, `priority.json`, `REPORT.md`, `candidate_reports.md` に整理する。必要なら optional LLM の Research Priority Reviewer が `research_priority.json` を作る。
 9. 研究者が次に検証する候補に**探索予算を配分**する。
 
 **モード:** コールド生成より、まず **「seed あり de-risk・拡張」モード** を作る(信頼でき、すぐ実研究に使える)。
