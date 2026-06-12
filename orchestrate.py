@@ -2152,13 +2152,28 @@ def candidate_fallbacks(c):
     return list(c.get("_fallbacks") or [])
 
 
+def fallback_is_retry_success(f):
+    return f.get("fallback_type") == "engine_retry_succeeded"
+
+
+def has_missing_verify_fallback(c):
+    return any(f.get("stage") == "verify" and not fallback_is_retry_success(f)
+               for f in candidate_fallbacks(c))
+
+
+def has_retry_success_fallback(c):
+    return any(fallback_is_retry_success(f) for f in candidate_fallbacks(c))
+
+
 def fallback_badge(c):
     fs = candidate_fallbacks(c)
     if not fs:
         return "-"
     stages = sorted({f.get("stage", "?") for f in fs})
-    if "verify" in stages:
+    if any(f.get("stage") == "verify" and not fallback_is_retry_success(f) for f in fs):
         return "未検証(fallback: " + ", ".join(stages) + ")"
+    if all(fallback_is_retry_success(f) for f in fs):
+        return "self-review(fallback: " + ", ".join(stages) + ")"
     return "劣化あり(fallback: " + ", ".join(stages) + ")"
 
 
@@ -2766,8 +2781,10 @@ def write_candidate_reports(charter, cands, run, cfg):
         return ((c.get("_verdict") or {}).get("provenance") or {}).get("engine", "-")
 
     def weakest(c):
-        if has_fallback_stage(c, "verify"):
+        if has_missing_verify_fallback(c):
             return "未検証(fallback): verifier 失敗のため再実行が必要"
+        if has_retry_success_fallback(c):
+            return "self-review(fallback): cross engine が失敗し生成 engine が審査。cross での再確認が望ましい"
         v = c.get("_verdict", {}) or {}
         if v.get("_form_fail"):   # 客観棄却の主要情報なので一覧にも理由を出す
             return f"形式不備: {_md_cell(v.get('kill_reason',''), 80)}"
@@ -2882,8 +2899,10 @@ def write_candidate_reports(charter, cands, run, cfg):
         for prov in ("arxiv", "inspire", "ntrs"):
             if prov in ev:
                 md.append(f"| 文献検索: {prov_names[prov]} | {_provider_status(prov, ev[prov])} |")
-        if has_fallback_stage(c, "verify"):
+        if has_missing_verify_fallback(c):
             md.append("| verifier | **未検証(fallback)**: verifier 失敗。verdict は flag として継続し、全観点 low confidence |")
+        elif has_retry_success_fallback(c):
+            md.append("| verifier | **self-review(fallback)**: cross engine が失敗し生成 engine が審査。verdict は存在するが、cross での再確認が望ましい |")
         md += ["| toy 計算・シミュレーション実行 | 未実施(実行系は未実装 / #17) |",
                "| 負例・対照チェック | 未実施 |"]
 
