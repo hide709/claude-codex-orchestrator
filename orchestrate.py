@@ -1208,6 +1208,27 @@ def apply_steering(prompt, run, stage, label, kind, engine="?"):
     return prompt + _steering_block(notes, stage)
 
 
+def copy_steering_application_for_retry(run, from_label, to_label, kind, engine="?"):
+    """Copy applied steering trace to a retry label without changing the already-built prompt."""
+    with STEERING_LOCK:
+        applied = [a for a in _steering_applied(run) if a.get("label") == from_label]
+        if not applied:
+            return
+        done = _applied_keys(run)
+        copied = []
+        for a in applied:
+            key = (a.get("note_id"), to_label)
+            if key in done:
+                continue
+            rec = dict(a)
+            rec.update({"ts": _now(), "label": to_label, "kind": kind,
+                        "engine": engine, "copied_from_label": from_label})
+            _append_jsonl_atomic(_control_dir(run) / "applied_notes.jsonl", rec)
+            copied.append(rec)
+        if copied:
+            write_operator_control(run)
+
+
 def write_operator_control(run_or_dir):
     rd = Path(run_or_dir["dir"] if isinstance(run_or_dir, dict) else run_or_dir)
     cd = _control_dir(rd)
@@ -1360,6 +1381,8 @@ def run_llm_job_with_retry(stage, kind, label, prompt, schema, run, cfg, engines
         planned.append((alt, f"{label}__fallback_{alt}"))
     for idx, (eng, used_label) in enumerate(planned):
         try:
+            if idx > 0:
+                copy_steering_application_for_retry(run, label, used_label, kind, engine=eng)
             data = make_runner_for(eng, cfg).run(prompt, schema, kind, used_label, run["log"])
             if idx > 0:
                 first = attempts[0]
@@ -1380,7 +1403,7 @@ def run_llm_job_with_retry(stage, kind, label, prompt, schema, run, cfg, engines
         except Exception as e:
             attempts.append({"engine": eng, "label": used_label, "error": e})
             if idx == 0 and len(planned) > 1:
-                log(run, f"  [{stage} {candidate_id or label}] {eng} 失敗({e}) → {planned[1][0]} で再試行")
+                log(run, f"  [{stage} {candidate_id or label}] {eng} 失敗({_short_error(e)}) → {planned[1][0]} で再試行")
     return None, primary, label, attempts
 
 
@@ -3059,8 +3082,9 @@ def report(charter, survivors, all_cands, run, cfg):
     ]
     if degraded_fbs:
         conclusion.insert(0, f"- ⚠ **この run は {len(degraded_fbs)} job が失敗し fallback で継続** — "
-                             "red-team/verify が欠けた、または生成 engine による self-review になった候補があります"
-                             "(詳細: ## 注意 / `fallbacks.json`)")
+                             "一部 stage の出力完全性または cross-engine 独立性が損なわれています"
+                             "(例: red-team/verify 欠落・self-review、proximity/research_priority の簡略 fallback。"
+                             "詳細: ## 注意 / `fallbacks.json`)")
     elif fbs:
         conclusion.insert(0, f"- engine retry: {len(fbs)} job が別 engine の再試行で成功(候補出力の劣化なし)。")
     if grow_first:
