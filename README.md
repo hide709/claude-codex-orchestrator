@@ -186,6 +186,9 @@ pip install -r requirements.txt
 ## 詳細設定の補足
 
 - 既定の engine は `dual` です。Codex と Claude Code の両方が解決できる場合は、発想レンズ(案を出すときの見方・切り口)を両 engine に割り当てます。
+- `dual` では、候補の red-team / verify は原則として生成した engine と別 engine に割り当てます。これにより自己レビューを避けます。
+- 現行の独立性は prompt-level です。同一 engine 内では常駐セッションを共有します(`session_scope=shared_engine_session`)。
+- `stage_engine.proximity` / `stage_engine.research_priority` で、候補集合全体を見る job の engine を明示指定できます。空文字なら secondary engine を使います。
 - `codex exec` や `claude -p` のような headless 実行は使いません。どちらも対話セッションとして起動します。
 - `reasoning_effort` と `service_tier` は Codex の対話起動時に `-c service_tier=...` / `-c model_reasoning_effort=...` として渡します。
 - `queue_poll_sec` と `queue_timeout_sec` は、LLM job の report を待つ間隔と上限時間です。`--timeout` で待ち時間を上書きできます。

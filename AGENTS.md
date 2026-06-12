@@ -39,6 +39,8 @@
 
 `PLANNER → GENERATE(独立・並列) → PROXIMITY(重複・近い候補を注釈) → RED-TEAM(攻撃→検証項目に変換) → REVISE(1回改訂) → VERIFY(形 + arXiv/INSPIRE/NASA NTRS + soundness/feasibility) → HARD GATE(形不備など客観のみ) → ARBITER(整理・勝者を選ばない)`
 
+dual engine では、候補単位の `RED-TEAM` / `VERIFY` は生成 engine と別 engine に割り当てる。`PROXIMITY` / `research_priority` は集合を見る job なので `stage_engine` で指定できる。
+
 ## Work Loop(この repo を触る agent 向け)
 
 1. ゴール・制約・現在地を確認する

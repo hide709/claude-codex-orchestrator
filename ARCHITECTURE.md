@@ -153,6 +153,7 @@ Planner -> Generate(engine x 発想レンズ) -> Proximity -> Red-team -> Revise
 - **出力:** `candidates/*.json`(Research Hypothesis Contract)。
 - **実行基盤:** ADR-001 の ConPTY(pywinpty) session + queue/report protocol。worktree 隔離は現行実装ではない。
 - **禁止:** 生成段階で他 worker の案を参照しない(独立性=多様性の源)。
+- **独立性の範囲(#59):** 現行 v1 は `prompt-level independent`。兄弟候補は prompt には渡さないが、同一 engine 内では `shared_engine_session` のため session-level では履歴を共有する。完全な `fresh_session_per_candidate` は #12/#42 の実測後に検討する future option。
 
 > ベンダー多様性(Claude vs Codex)より、**戦略多様性(発想レンズの違い)**の方が候補の質に効く。
 > 「単一モデル+複数戦略プロンプト」でも多様性は出る。ベンダー混在の追加価値は §11 の H2 で検証する。
@@ -162,6 +163,7 @@ Planner -> Generate(engine x 発想レンズ) -> Proximity -> Red-team -> Revise
 - **機構:** クラスタ所属は**決定的**(char-bigram Jaccard + union-find)。LLM は theme / diversity_warning / underexplored_axes の**ラベル付けのみ**(所属を変更しない。失敗しても決定的注釈は残る)。
 - **出力:** `proximity.json`、各候補に `_cluster_id`、decision_matrix の cluster 列、REPORT の多様性セクション。
 - **禁止:** **これを理由に棄却しない**(全メンバーが red-team / verify を受ける)。representative は表示・整理用であり、予算配分に使うのは #37 の責務。cross-run 重複検知(memory/seen)とは別物。
+- **engine 割当(#59):** 候補集合全体を見る job なので cross-engine 原則の対象外。`stage_engine.proximity` で明示指定でき、空文字なら secondary engine を使う。
 - **lineage(Issue #35):** 各候補は `_lineage`(hypothesis_id / generation_round / parents / operator / cluster_id / 自己申告の changes・resolved_red_team_issues)を持ち、run 終端で `hypothesis_graph.{json,md}`(seed→生成→攻撃→改訂→検証の typed edges)に決定的に集約される。**graph は data model であり、実行は linear pipeline のまま**(scheduler の導入判断は Issue #42)。
 
 ### 3.4 RED-TEAM（cross-review を付け替えたもの）
@@ -172,6 +174,7 @@ Planner -> Generate(engine x 発想レンズ) -> Proximity -> Red-team -> Revise
   - **judge しない。** 「良い/悪い」「どちらが勝ち」「スコア」を出さない(これは VERIFIER と HUMAN の領分)。
   - **均質化させない。** 案をマージ/合意へ寄せる圧をかけない。攻撃されたら原案を改訂(justified diff)するか、原案と改訂版を2候補として残す。
 - **位置づけ:** critic は「反証仮説を生成」するだけ。正しいかは VERIFIER が客観確認する(critique 自体に generate-and-verify を再帰)。critic は VERIFIER の recall を上げる役で、裁判官ではない。
+- **engine 割当(#59):** dual では候補を生成した engine と別 engine が red-team する。単一 engine のときは従来どおり同じ engine で処理する。
 
 ### 3.5 VERIFIER
 - **責務:** **候補ごとに・客観的に** 検証し、証拠(evidence)と verdict を出す。
@@ -183,6 +186,7 @@ Planner -> Generate(engine x 発想レンズ) -> Proximity -> Red-team -> Revise
   - **候補同士を比較しない**(横断は ARBITER の仕事)。
   - **「良し悪し」を主観判定しない。** 測れる事実だけを出す。
   - **生成者と同一であってはならない**(Codex worker が自分用の Verifier/gate を設計するのは利益相反。gate は PLANNER/人間が事前固定)。
+- **engine 割当(#59):** dual では候補を生成した engine と別 engine が verify する。実際の検証 engine は `verdicts/*.json` の provenance と `candidate_reports.md` に残す。
 - **重要(研究の新規性):** 文献チェックは AI の記憶でやらない。現行 provider は **arXiv / INSPIRE-HEP / NASA NTRS**。ADS / TechPort / Semantic Scholar / 一般ウェブ検索は future provider。**出典を tier 付けして evidence に記録**する:
     - 権威DB(INSPIRE等のcurated DB) > 査読論文 > preprint(arXiv等) > web/blog
     - 低 tier(blog 等)を単独で「先行研究が否定」などの反証扱いにしない。
@@ -210,6 +214,7 @@ Planner -> Generate(engine x 発想レンズ) -> Proximity -> Red-team -> Revise
   重複)から**決定的に**計算したもの(LLM 不使用)。採用/棄却には使わない。**floor 保証**: 低 priority でも
   棄却されず baseline 検証は全員が受け続ける(de-facto kill の禁止)。AI debate / pairwise を信号に使う場合も
   argument_trace(#36)として evidence と分離し、opt-in とする。
+- **research_priority の engine 割当(#59):** `research_priority.json` を作る LLM job は候補集合全体を見るため `stage_engine.research_priority` で指定できる。空文字なら secondary engine。
 
 ### 3.8 ARTIFACT BUS
 - **責務:** 全コンポーネント間の受け渡しをファイルで行う(YAML/MD/JSON/diff)。
@@ -424,14 +429,16 @@ attacks:
 1. 研究者が **seed(問い or hunch) + 制約(使える装置/データ/計算資源)** を入力。
 2. 複数 worker が**発想レンズ(案を出すときの見方・切り口)**で候補仮説を N 個生成(独立)。
 3. **PROXIMITY** が近い候補・重複・未探索方向を注釈する(棄却には使わない)。
-4. **RED-TEAM** が攻撃 → 検証可能項目に変換。
+4. **RED-TEAM** が攻撃 → 検証可能項目に変換。dual では生成 engine と別 engine に割り当てる。
 5. 攻撃を受けて候補を **1回だけ revise** する(原案は保存)。
-6. **VERIFIER** が Tier 0 を実行: 形式、文献候補、筋の良さ、実行しやすさを確認。
+6. **VERIFIER** が Tier 0 を実行: 形式、文献候補、筋の良さ、実行しやすさを確認。dual では生成 engine と別 engine に割り当てる。
 7. **HARD GATE** は形不備など客観的な不備だけを自動棄却する。LLM の kill は `kill?(LLM/要確認)` として残す。
 8. **ARBITER** が `decision_matrix.*`, `priority.json`, `research_priority.json`, `REPORT.md`, `candidate_reports.md` に整理する。
 9. 研究者が次に検証する候補に**探索予算を配分**する。
 
 **モード:** コールド生成より、まず **「seed あり de-risk・拡張」モード** を作る(信頼でき、すぐ実研究に使える)。
+
+provenance には `session_scope: "shared_engine_session"` を記録する。これは「同一 engine 内では常駐セッションを共有する」ことを意味する。
 
 ---
 
@@ -463,6 +470,7 @@ attacks:
 | research_priority | 研究として育てる順の LLM 推奨。要確認であり、採用判定ではない。 |
 | fallback | LLM job の失敗、timeout、出力不備を別 engine や既定値で補って run を止めずに続けた記録。`count > 0` の run は通常より注意して読む。 |
 | operator steering | 実行中に人間が注意点を artifact として追記する仕組み。evidence ではない。 |
+| session_scope | LLM セッション履歴の共有範囲。現行は `shared_engine_session` で、同一 engine 内では session-level の履歴を共有する。 |
 | 新しさ(novelty) | 既知研究との差。README や report ではこの日本語ラベルを使う。 |
 | 筋の良さ(soundness) | 物理・理屈として破綻していないか。 |
 | 実行しやすさ(feasibility) | 最初の検証に必要なデータ、計算、工数が現実的か。 |

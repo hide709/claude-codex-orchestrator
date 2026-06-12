@@ -670,6 +670,91 @@ def usable_engines(engines, cfg):
     return [e for e in engines if engine_available(e, cfg)]
 
 
+SESSION_SCOPE = "shared_engine_session"
+STAGE_ENGINE_KEYS = {"proximity", "research_priority"}
+
+
+def _dedupe(seq):
+    out = []
+    for x in seq or []:
+        if x and x not in out:
+            out.append(x)
+    return out
+
+
+def _base_engine(name):
+    """`codex(fallback<claude)` のような表示名から、実際に走った engine 名だけを取り出す。"""
+    m = re.match(r"([A-Za-z0-9_-]+)", str(name or "").strip())
+    return m.group(1) if m else ""
+
+
+def _candidate_index(c):
+    m = re.search(r"(\d+)", str(c.get("id", "")))
+    return int(m.group(1)) if m else 0
+
+
+def _engine_by_index(c, engines):
+    engines = _dedupe(engines)
+    return engines[_candidate_index(c) % len(engines)] if engines else ""
+
+
+def _author_engine(c, engines):
+    base = _base_engine(c.get("_engine"))
+    return base if base in _dedupe(engines) else ""
+
+
+def _author_or_round_robin_engine(c, engines):
+    return _author_engine(c, engines) or _engine_by_index(c, engines)
+
+
+def _cross_engine_for_candidate(c, engines):
+    engines = _dedupe(engines)
+    if not engines:
+        return ""
+    if len(engines) == 1:
+        return engines[0]
+    author = _author_engine(c, engines)
+    if author:
+        for eng in engines:
+            if eng != author:
+                return eng
+    return _engine_by_index(c, engines)
+
+
+def _alternate_engine(engine, engines):
+    engines = _dedupe(engines)
+    base = _base_engine(engine)
+    for eng in engines:
+        if eng != base:
+            return eng
+    return ""
+
+
+def _secondary_engine(engines):
+    engines = _dedupe(engines)
+    if len(engines) >= 2:
+        return engines[1]
+    return engines[0] if engines else ""
+
+
+def _stage_engine(stage, cfg, engines):
+    raw = (cfg.get("stage_engine") or {}).get(stage, "")
+    return raw or _secondary_engine(engines)
+
+
+def validate_stage_engine_config(cfg, live_engines):
+    stage_engine = cfg.get("stage_engine") or {}
+    if not isinstance(stage_engine, dict):
+        raise SystemExit("stage_engine は object で指定してください")
+    live = set(_dedupe(live_engines))
+    for stage, eng in stage_engine.items():
+        if stage not in STAGE_ENGINE_KEYS:
+            allowed = ", ".join(sorted(STAGE_ENGINE_KEYS))
+            raise SystemExit(f"stage_engine で指定できる stage は {allowed} のみです: {stage}")
+        if eng and eng not in live:
+            raise SystemExit(f"stage_engine.{stage}={eng} は使用可能 engine に含まれていません: {sorted(live)}")
+
+
 # ----------------------------------------------------------------------------
 # プロンプト
 # ----------------------------------------------------------------------------
@@ -1202,7 +1287,8 @@ def _short_error(e, n=300):
     return _SECRET_RE.sub("[REDACTED]", str(e))[:n]
 
 
-def record_fallback(run, stage, label, candidate_id="", fallback_type="", effect="", reason="", engine=""):
+def record_fallback(run, stage, label, candidate_id="", fallback_type="", effect="", reason="", engine="",
+                    degraded=True):
     """Record a deterministic degradation event; do not infer from human log text."""
     rec = {
         "ts": _now(),
@@ -1213,6 +1299,7 @@ def record_fallback(run, stage, label, candidate_id="", fallback_type="", effect
         "effect": effect,
         "reason": _SECRET_RE.sub("[REDACTED]", str(reason))[:500],
         "engine": engine,
+        "degraded": bool(degraded),
     }
     with FALLBACK_LOCK:
         run.setdefault("_fallbacks", []).append(rec)
@@ -1220,13 +1307,17 @@ def record_fallback(run, stage, label, candidate_id="", fallback_type="", effect
 
 
 def attach_candidate_fallback(c, rec):
-    item = {k: rec[k] for k in ("stage", "candidate_id", "fallback_type", "effect", "engine")
+    item = {k: rec[k] for k in ("stage", "candidate_id", "fallback_type", "effect", "engine", "label")
             if rec.get(k)}
     c.setdefault("_fallbacks", []).append(item)
 
 
 def fallback_records(run):
     return list(run.get("_fallbacks") or [])
+
+
+def degraded_fallback_records(run):
+    return [r for r in fallback_records(run) if r.get("degraded", True)]
 
 
 def write_fallbacks(run):
@@ -1237,10 +1328,51 @@ def write_fallbacks(run):
         by_stage[r.get("stage", "?")] = by_stage.get(r.get("stage", "?"), 0) + 1
     write_json(run, "fallbacks.json", {
         "count": len(recs),
+        "degraded_count": len(degraded_fallback_records(run)),
         "by_stage": by_stage,
         "affected_candidates": affected,
         "records": recs,
     })
+
+
+def _attempt_chain(attempts):
+    return "->".join(a["engine"] for a in attempts if a.get("engine"))
+
+
+def _attempt_errors(attempts):
+    return " / ".join(f"{a['engine']}: {_short_error(a['error'])}" for a in attempts)
+
+
+def run_llm_job_with_retry(stage, kind, label, prompt, schema, run, cfg, engines, engine,
+                           candidate_id=""):
+    """Run one LLM job on the selected engine, then retry once on the alternate engine.
+
+    A successful retry is recorded in fallbacks.json for auditability, but marked
+    degraded=false because the stage still produced a proper LLM output.
+    """
+    engines = _dedupe(engines)
+    primary = _base_engine(engine) or (engines[0] if engines else cfg.get("engine", "mock"))
+    attempts = []
+    planned = [(primary, label)]
+    alt = _alternate_engine(primary, engines)
+    if alt:
+        planned.append((alt, f"{label}__fallback_{alt}"))
+    for idx, (eng, used_label) in enumerate(planned):
+        try:
+            data = make_runner_for(eng, cfg).run(prompt, schema, kind, used_label, run["log"])
+            if idx > 0:
+                first = attempts[0]
+                record_fallback(
+                    run, stage, used_label, candidate_id=candidate_id,
+                    fallback_type="engine_retry_succeeded",
+                    effect=f"{first['engine']} failed; {eng} retry produced a valid {kind} output",
+                    reason=first["error"], engine=f"{first['engine']}->{eng}", degraded=False)
+            return data, eng, used_label, attempts
+        except Exception as e:
+            attempts.append({"engine": eng, "label": used_label, "error": e})
+            if idx == 0 and len(planned) > 1:
+                log(run, f"  [{stage} {candidate_id or label}] {eng} 失敗({e}) → {planned[1][0]} で再試行")
+    return None, primary, label, attempts
 
 
 # ----------------------------------------------------------------------------
@@ -1283,6 +1415,7 @@ def provenance(run, cfg, stage, label, **extra):
         "run_id": run["id"],
         "created": _now(),
         "repo_commit": run.get("commit", ""),
+        "session_scope": SESSION_SCOPE,
     }
     data.update(extra)
     return data
@@ -1377,7 +1510,7 @@ def generate(runner, charter, cfg, run, mem):
     return cands
 
 
-def proximity(runner, cands, charter, cfg, run):
+def proximity(cands, charter, cfg, run):
     """within-run の重複検知・多様性確認(Issue #34 / Co-Scientist の Proximity 相当)。
     **注釈のみ** — これを理由に棄却しない。全メンバーが後段の red-team / verify を受ける。
     クラスタ所属は決定的(char-bigram Jaccard + union-find)。LLM はラベル付けのみ
@@ -1426,6 +1559,8 @@ def proximity(runner, cands, charter, cfg, run):
 
     if cfg.get("proximity_llm_enabled", True):
         label = f"{run['id']}__proximity"
+        engines = charter.get("engines") or [cfg.get("engine", "mock")]
+        eng = _stage_engine("proximity", cfg, engines)
         shown = [{"id": c["id"], "lens": c.get("_lens", ""), "question": c.get("question", ""),
                   "hypothesis": c.get("hypothesis", "")} for c in cands]
         fixed = [{k: cl[k] for k in ("cluster_id", "members", "representative")} for cl in clusters]
@@ -1434,19 +1569,25 @@ def proximity(runner, cands, charter, cfg, run):
                         candidates=json.dumps(shown, ensure_ascii=False, indent=2),
                         clusters=json.dumps(fixed, ensure_ascii=False, indent=2),
                         schema=json.dumps(PROXIMITY_SCHEMA, ensure_ascii=False))
-        prompt = apply_steering(prompt, run, "proximity", label, "proximity",
-                                engine=getattr(runner, "engine", cfg.get("engine", "?")))
-        try:
-            res = runner.run(prompt, PROXIMITY_SCHEMA, "proximity", label, run["log"])
+        prompt = apply_steering(prompt, run, "proximity", label, "proximity", engine=eng)
+        res, used_engine, used_label, attempts = run_llm_job_with_retry(
+            "proximity", "proximity", label, prompt, PROXIMITY_SCHEMA, run, cfg, engines, eng)
+        if res is not None:
             lbl = {x.get("cluster_id"): x for x in res.get("clusters", [])}
             for cl in clusters:
                 if cl["cluster_id"] in lbl:
                     cl["theme"] = lbl[cl["cluster_id"]].get("theme", "")
                     cl["diversity_warning"] = lbl[cl["cluster_id"]].get("diversity_warning", "")
             data["underexplored_axes"] = res.get("underexplored_axes", [])
-            data["provenance"] = provenance(run, cfg, "proximity", label)
-        except Exception as e:
-            log(run, f"  [proximity] ラベル付け失敗(決定的クラスタのみ残す): {e}")
+            data["provenance"] = provenance(run, cfg, "proximity", used_label, engine=used_engine,
+                                            stage_engine=eng)
+        else:
+            log(run, f"  [proximity] ラベル付け失敗(決定的クラスタのみ残す): {_attempt_errors(attempts)}")
+            rec = record_fallback(
+                run, "proximity", label, fallback_type="deterministic_clusters_only",
+                effect="proximity LLM labeling failed; deterministic clusters continued",
+                reason=_attempt_errors(attempts), engine=_attempt_chain(attempts))
+            data["_fallback"] = rec
 
     for cl in clusters:
         for m in cl["members"]:
@@ -1464,32 +1605,41 @@ def proximity(runner, cands, charter, cfg, run):
     return cands
 
 
-def redteam(runner, cands, cfg, run):
+def redteam(cands, charter, cfg, run):
     """cross red-team: 攻撃 -> 検証可能項目に変換。judge しない。"""
     tmpl = load_prompt("redteam")
     checks = cfg.get("redteam_extra_checks") or []          # 無ければ空文字(プロンプト側は『空なら無視』)
     extra_checks = "\n".join(f"- {x}" for x in checks)
+    engines = charter.get("engines") or [cfg.get("engine", "mock")]
 
     def one(c):
         label = f"{run['id']}__review_{c['id']}"
+        eng = _cross_engine_for_candidate(c, engines)
         # blind: 著者(レンズ)情報は渡さない
         shown = {k: v for k, v in c.items()
                  if not k.startswith("_") and k not in ("id", "provenance")}
         prompt = render(tmpl, candidate=json.dumps(shown, ensure_ascii=False, indent=2),
                         extra_checks=extra_checks,
                         schema=json.dumps(REVIEW_SCHEMA, ensure_ascii=False))
-        prompt = apply_steering(prompt, run, "redteam", label, "review",
-                                engine=getattr(runner, "engine", cfg.get("engine", "?")))
-        try:
-            return c["id"], runner.run(prompt, REVIEW_SCHEMA, "review", label, run["log"])
-        except Exception as e:
-            log(run, f"  [review {c['id']}] FAILED: {e}")
-            rec = record_fallback(
+        prompt = apply_steering(prompt, run, "redteam", label, "review", engine=eng)
+        data, used_engine, used_label, attempts = run_llm_job_with_retry(
+            "redteam", "review", label, prompt, REVIEW_SCHEMA, run, cfg, engines, eng,
+            candidate_id=c["id"])
+        if data is not None:
+            data["provenance"] = provenance(run, cfg, "redteam", used_label, target=c["id"],
+                                            engine=used_engine,
+                                            author_engine=_author_engine(c, engines) or "?")
+            return c["id"], data
+        log(run, f"  [review {c['id']}] FAILED: {_attempt_errors(attempts)}")
+        rec = record_fallback(
                 run, "redteam", label, candidate_id=c["id"],
                 fallback_type="empty_attacks",
                 effect="red-team failed; attacks=[] so the candidate continued without attacks",
-                reason=e, engine=getattr(runner, "engine", cfg.get("engine", "?")))
-            return c["id"], {"attacks": [], "_fallback": rec}
+                reason=_attempt_errors(attempts), engine=_attempt_chain(attempts))
+        return c["id"], {"attacks": [], "_fallback": rec,
+                         "provenance": provenance(run, cfg, "redteam", label, target=c["id"],
+                                                  engine=_attempt_chain(attempts),
+                                                  author_engine=_author_engine(c, engines) or "?")}
 
     results = dict(_parallel(cfg, [(one, (c,)) for c in cands]))
     variants = []        # stronger_variant: 未追跡として未解決へ
@@ -1497,7 +1647,6 @@ def redteam(runner, cands, cfg, run):
         rv = results.get(c["id"], {"attacks": []})
         if rv.get("_fallback"):
             attach_candidate_fallback(c, rv["_fallback"])
-        rv["provenance"] = provenance(run, cfg, "redteam", f"{run['id']}__review_{c['id']}", target=c["id"])
         c["_review"] = rv
         write_json(run, f"reviews/{c['id']}.json", rv)
         todo = []
@@ -1515,25 +1664,29 @@ def redteam(runner, cands, cfg, run):
     return cands
 
 
-def revise(runner, cands, cfg, run):
+def revise(cands, charter, cfg, run):
     """red-team の攻撃を受けて、自案を1回だけ改訂する。原案は candidates/ に残す。"""
     tmpl = load_prompt("revise")
+    engines = charter.get("engines") or [cfg.get("engine", "mock")]
 
     def one(c):
         label = f"{run['id']}__revise_{c['id']}"
+        eng = _author_or_round_robin_engine(c, engines)
         shown = {k: v for k, v in c.items()
                  if not k.startswith("_") and k not in ("provenance",)}
         prompt = render(tmpl,
                         candidate=json.dumps(shown, ensure_ascii=False, indent=2),
                         review=json.dumps(c.get("_review", {"attacks": []}), ensure_ascii=False, indent=2),
                         schema=json.dumps(HYPOTHESIS_SCHEMA, ensure_ascii=False))
-        prompt = apply_steering(prompt, run, "revise", label, "hypothesis",
-                                engine=getattr(runner, "engine", cfg.get("engine", "?")))
-        try:
-            data = runner.run(prompt, HYPOTHESIS_SCHEMA, "hypothesis", label, run["log"])
+        prompt = apply_steering(prompt, run, "revise", label, "hypothesis", engine=eng)
+        data, used_engine, used_label, attempts = run_llm_job_with_retry(
+            "revise", "hypothesis", label, prompt, HYPOTHESIS_SCHEMA, run, cfg, engines, eng,
+            candidate_id=c["id"])
+        if data is not None:
             data["id"] = c["id"]
             data["_lens"] = c.get("_lens", "?")
             data["_engine"] = c.get("_engine", "?")   # 生成 engine の印を改訂後にも引き継ぐ
+            data["_revise_engine"] = used_engine
             data["_review"] = c.get("_review", {"attacks": []})
             data["_verify_todo"] = c.get("_verify_todo", [])
             for k in ("_near_dup", "_cluster_id", "_cluster_rep"):
@@ -1545,16 +1698,18 @@ def revise(runner, cands, cfg, run):
                                 "cluster_id": c.get("_cluster_id", ""),
                                 "changes": data.pop("changes", None) or [],
                                 "resolved_red_team_issues": data.pop("resolved_red_team_issues", None) or []}
-            data["provenance"] = provenance(run, cfg, "revise", label,
-                                            lens=c.get("_lens", "?"), revised_from=c["id"])
+            data["provenance"] = provenance(run, cfg, "revise", used_label,
+                                            lens=c.get("_lens", "?"), revised_from=c["id"],
+                                            engine=used_engine,
+                                            author_engine=_author_engine(c, engines) or "?")
             return data
-        except Exception as e:
-            log(run, f"  [revise {c['id']}] FAILED: {e} / 原案を継続")
+        else:
+            log(run, f"  [revise {c['id']}] FAILED: {_attempt_errors(attempts)} / 原案を継続")
             rec = record_fallback(
                 run, "revise", label, candidate_id=c["id"],
                 fallback_type="original_continued",
                 effect="revise failed; original candidate continued",
-                reason=e, engine=getattr(runner, "engine", cfg.get("engine", "?")))
+                reason=_attempt_errors(attempts), engine=_attempt_chain(attempts))
             attach_candidate_fallback(c, rec)
             c["_lineage"] = {**c.get("_lineage", {}), "operator": "revise_failed", "parents": [c["id"]]}
             return c
@@ -1793,13 +1948,14 @@ def evidence_refs(c):
     return [f"evidence/{c['id']}.{prov}.json" for prov in ("arxiv", "inspire", "ntrs")]
 
 
-def verify(runner, cands, cfg, run, mem):
+def verify(cands, charter, cfg, run, mem):
     """Tier0 検証: 形(決定的) + 文献/soundness/feasibility(独立な検証呼び出し)。"""
     tmpl = load_prompt("verifier")
     required = HYPOTHESIS_SCHEMA["required"]
     axes = cfg.get("eval_axes", DEFAULT_EVAL_AXES)
     vschema = verdict_schema(axes)
     extra_axes = extra_axes_text(axes, cfg)
+    engines = charter.get("engines") or [cfg.get("engine", "mock")]
 
     def form_ok(c):
         missing = [k for k in required if k in ("assumptions", "unknowns")
@@ -1812,10 +1968,14 @@ def verify(runner, cands, cfg, run, mem):
 
     def one(c):
         label = f"{run['id']}__verify_{c['id']}"
+        eng = _cross_engine_for_candidate(c, engines)
         miss = form_ok(c)
         if miss:
             return c["id"], {"_form_fail": miss, "verdict": "kill",
-                             "kill_reason": f"形不備(必須欠落): {', '.join(miss)}"}
+                             "kill_reason": f"形不備(必須欠落): {', '.join(miss)}",
+                             "provenance": provenance(run, cfg, "verify", label, target=c["id"],
+                                                      engine="deterministic-form-check",
+                                                      author_engine=_author_engine(c, engines) or "?")}
         prior_art_hint = collect_evidence(c, cfg, run)
         todo_items = list(c.get("_verify_todo", []))
         _rej = memory_reject_hint(mem)
@@ -1828,23 +1988,28 @@ def verify(runner, cands, cfg, run, mem):
                         extra_axes=extra_axes,
                         prior_art_hint=json.dumps(prior_art_hint, ensure_ascii=False, indent=2),
                         schema=json.dumps(vschema, ensure_ascii=False))
-        prompt = apply_steering(prompt, run, "verify", label, "verdict",
-                                engine=getattr(runner, "engine", cfg.get("engine", "?")))
-        try:
-            verdict = runner.run(prompt, vschema, "verdict", label, run["log"])
-            verdict["provenance"] = provenance(run, cfg, "verify", label, target=c["id"])
+        prompt = apply_steering(prompt, run, "verify", label, "verdict", engine=eng)
+        verdict, used_engine, used_label, attempts = run_llm_job_with_retry(
+            "verify", "verdict", label, prompt, vschema, run, cfg, engines, eng,
+            candidate_id=c["id"])
+        if verdict is not None:
+            verdict["provenance"] = provenance(run, cfg, "verify", used_label, target=c["id"],
+                                               engine=used_engine,
+                                               author_engine=_author_engine(c, engines) or "?")
             verdict["evidence_refs"] = evidence_refs(c)
             return c["id"], verdict
-        except Exception as e:
-            log(run, f"  [verify {c['id']}] FAILED: {e}")
+        else:
+            log(run, f"  [verify {c['id']}] FAILED: {_attempt_errors(attempts)}")
             rec = record_fallback(
                 run, "verify", label, candidate_id=c["id"],
                 fallback_type="flag_unverified",
                 effect="verify failed; verdict=flag with all axes 未検証",
-                reason=e, engine=getattr(runner, "engine", cfg.get("engine", "?")))
+                reason=_attempt_errors(attempts), engine=_attempt_chain(attempts))
             fb = {"verdict": "flag", "kill_reason": "",
-                  "notes": f"検証エラー(要再実行): {_short_error(e)}", "prior_art": [],
-                  "provenance": provenance(run, cfg, "verify", label, target=c["id"]),
+                  "notes": f"検証エラー(要再実行): {_attempt_errors(attempts)}", "prior_art": [],
+                  "provenance": provenance(run, cfg, "verify", label, target=c["id"],
+                                           engine=_attempt_chain(attempts),
+                                           author_engine=_author_engine(c, engines) or "?"),
                   "evidence_refs": evidence_refs(c),
                   "_fallback": rec}
             for ax in axes:
@@ -2338,15 +2503,26 @@ def _search_quality_section(run, cands, cfg, charter):
 def _warnings_section(run, all_cands):
     lines = []
     fbs = fallback_records(run)
-    if fbs:
+    degraded = degraded_fallback_records(run)
+    retry_only = [f for f in fbs if not f.get("degraded", True)]
+    if degraded:
         by_stage = {}
-        for f in fbs:
+        for f in degraded:
             by_stage[f.get("stage", "?")] = by_stage.get(f.get("stage", "?"), 0) + 1
-        affected = sorted({f.get("candidate_id") for f in fbs if f.get("candidate_id")})
+        affected = sorted({f.get("candidate_id") for f in degraded if f.get("candidate_id")})
         lines += [
-            f"- ⚠ fallbackによる静かな劣化: {len(fbs)} job が失敗し、fallback / 継続処理で完走しています。",
+            f"- ⚠ fallbackによる静かな劣化: {len(degraded)} job が失敗し、fallback / 継続処理で完走しています。",
             f"- stage別: {', '.join(f'{k}:{v}' for k, v in sorted(by_stage.items()))}",
             f"- 影響候補: {', '.join(affected) if affected else '(候補生成前/候補なし)'}",
+            "- 詳細: `fallbacks.json` / `events.jsonl`",
+        ]
+    elif retry_only:
+        by_stage = {}
+        for f in retry_only:
+            by_stage[f.get("stage", "?")] = by_stage.get(f.get("stage", "?"), 0) + 1
+        lines += [
+            f"- engine retry: {len(retry_only)} job が別 engine の再試行で成功しました(候補出力の劣化なし)。",
+            f"- stage別: {', '.join(f'{k}:{v}' for k, v in sorted(by_stage.items()))}",
             "- 詳細: `fallbacks.json` / `events.jsonl`",
         ]
     else:
@@ -2423,7 +2599,7 @@ def _next_round_notes_text(run):
     return "\n".join(f"- {n.get('id')}: {n.get('note')}" for n in active)
 
 
-def research_priority(runner, charter, survivors, cfg, run):
+def research_priority(charter, survivors, cfg, run):
     """Issue #61: 研究として育てる順を LLM 推奨・要確認として出す。
     decision_matrix / hard gate / evidence level には混ぜない。失敗しても run は完走する。"""
     if not cfg.get("grow_priority_enabled", True):
@@ -2454,14 +2630,17 @@ def research_priority(runner, charter, survivors, cfg, run):
             "prior_art_count": len(v.get("prior_art") or []),
         })
     label = f"{run['id']}__research_priority"
+    engines = charter.get("engines") or [cfg.get("engine", "mock")]
+    eng = _stage_engine("research_priority", cfg, engines)
     tmpl = load_prompt("research_priority")
     prompt = render(tmpl,
                     candidates=json.dumps(payload, ensure_ascii=False, indent=2),
                     schema=json.dumps(RESEARCH_PRIORITY_SCHEMA, ensure_ascii=False))
-    prompt = apply_steering(prompt, run, "next_round", label, "research_priority",
-                            engine=getattr(runner, "engine", cfg.get("engine", "?")))
-    try:
-        raw = runner.run(prompt, RESEARCH_PRIORITY_SCHEMA, "research_priority", label, run["log"])
+    prompt = apply_steering(prompt, run, "next_round", label, "research_priority", engine=eng)
+    raw, used_engine, used_label, attempts = run_llm_job_with_retry(
+        "research_priority", "research_priority", label, prompt, RESEARCH_PRIORITY_SCHEMA,
+        run, cfg, engines, eng)
+    if raw is not None:
         allowed = {c["id"] for c in survivors}
         recs = []
         for i, rec in enumerate(raw.get("recommendations") or [], 1):
@@ -2482,17 +2661,25 @@ def research_priority(runner, charter, survivors, cfg, run):
         data = {"recommendations": recs,
                 "note": _scrub_research_priority_text(raw.get("note")),
                 "label": "LLM 推奨・要確認。採用判定ではない。",
-                "provenance": {**provenance(run, cfg, "research_priority", label),
+                "provenance": {**provenance(run, cfg, "research_priority", used_label,
+                                            engine=used_engine, stage_engine=eng),
                                "input_artifacts": ["candidates/*.json", "verdicts/*.json", "priority.json",
                                                    "control/operator_notes.jsonl"],
                                "next_round_notes": _next_round_notes_text(run)}}
-    except Exception as e:
-        log(run, f"  [research_priority] FAILED: {e}")
+    else:
+        log(run, f"  [research_priority] FAILED: {_attempt_errors(attempts)}")
+        rec = record_fallback(
+            run, "research_priority", label,
+            fallback_type="recommendations_empty",
+            effect="research_priority failed; recommendations=[] so humans use decision_matrix",
+            reason=_attempt_errors(attempts), engine=_attempt_chain(attempts))
         data = {"recommendations": [],
                 "note": "推奨生成に失敗。verdict 等から人間が判断してください。",
                 "label": "LLM 推奨・要確認。採用判定ではない。",
-                "error": _short_error(e),
-                "provenance": {**provenance(run, cfg, "research_priority", label),
+                "error": _attempt_errors(attempts),
+                "_fallback": rec,
+                "provenance": {**provenance(run, cfg, "research_priority", label,
+                                            engine=_attempt_chain(attempts), stage_engine=eng),
                                "input_artifacts": ["candidates/*.json", "verdicts/*.json", "priority.json",
                                                    "control/operator_notes.jsonl"],
                                "next_round_notes": _next_round_notes_text(run)}}
@@ -2539,6 +2726,9 @@ def write_candidate_reports(charter, cands, run, cfg):
     def has_fallback_stage(c, stage):
         return any(x.get("stage") == stage for x in candidate_fallbacks(c))
 
+    def verify_engine(c):
+        return ((c.get("_verdict") or {}).get("provenance") or {}).get("engine", "-")
+
     def weakest(c):
         if has_fallback_stage(c, "verify"):
             return "未検証(fallback): verifier 失敗のため再実行が必要"
@@ -2571,7 +2761,7 @@ def write_candidate_reports(charter, cands, run, cfg):
           "- 内部キー(英語)との対応は末尾の用語対応表を参照。",
           "",
           "## 候補一覧"]
-    summary_header = ["ID", "問い", "engine", "発想レンズ", "クラスタ", "状態"]
+    summary_header = ["ID", "問い", "生成engine", "検証engine", "発想レンズ", "クラスタ", "状態"]
     if show_fallback:
         summary_header.append("fallback警告")
     summary_header += ["次に深掘り(配分)", "最大の不確実点"]
@@ -2579,7 +2769,7 @@ def write_candidate_reports(charter, cands, run, cfg):
     for c in cands:
         cells = [
             c["id"], _md_cell(c.get("question", ""), 80), c.get("_engine", "?"),
-            c.get("_lens", "?"), c.get("_cluster_id", "-"), status_of(c)]
+            verify_engine(c), c.get("_lens", "?"), c.get("_cluster_id", "-"), status_of(c)]
         if show_fallback:
             cells.append(fallback_summary(c))
         cells += [
@@ -2625,6 +2815,7 @@ def write_candidate_reports(charter, cands, run, cfg):
                   if lin.get("resolved_red_team_issues") else [] ),
                "",
                "### 3. 評価まとめ(verifier / 各観点)",
+               f"- 検証 engine: `{verify_engine(c)}`",
                "| 観点 | 評価 | 根拠の強さ |", "|---|---|---|"]
         for ax in axes:
             a = v.get(ax) or {}
@@ -2766,7 +2957,7 @@ def write_memory_suggestions(charter, cands, survivors, run, cfg):
             [f"類似元 run: {', '.join(runs_hit[:3])}"],
             "python orchestrate.py prefer '<この方向を深める / 避ける 等の方針>'")
     # 4) engine 失敗の反復(≥2回)→ failure_pattern(issue 化候補)。ログ文字列でなく明示カウンタ(#55)を見る。
-    fails = fallback_records(run)
+    fails = degraded_fallback_records(run)
     if len(fails) >= 2:
         add("failure_pattern", "issue",
             f"engine 失敗/フォールバックが {len(fails)} 回発生",
@@ -2837,6 +3028,7 @@ def report(charter, survivors, all_cands, run, cfg):
     eng_bd = ", ".join(f"{k}:{v}" for k, v in sorted(_eng.items())) or "-"
     write_fallbacks(run)
     fbs = fallback_records(run)
+    degraded_fbs = degraded_fallback_records(run)
     first_row = next(iter(_priority_rows(run)), {})
     first_id = first_row.get("id")
     grow_recs = (run.get("research_priority") or {}).get("recommendations") or []
@@ -2851,9 +3043,11 @@ def report(charter, survivors, all_cands, run, cfg):
            if any(c.get("_llm_kill") for c in survivors) else ""),
         f"- created: {run['created']}",
     ]
-    if fbs:
-        conclusion.insert(0, f"- ⚠ **この run は {len(fbs)} job が失敗し fallback で継続** — "
+    if degraded_fbs:
+        conclusion.insert(0, f"- ⚠ **この run は {len(degraded_fbs)} job が失敗し fallback で継続** — "
                              "red-team/verify が欠けた候補があります(詳細: ## 注意 / `fallbacks.json`)")
+    elif fbs:
+        conclusion.insert(0, f"- engine retry: {len(fbs)} job が別 engine の再試行で成功(候補出力の劣化なし)。")
     if grow_first:
         conclusion.append(f"- 最初に読む候補(LLM 推奨・要確認): **{grow_first.get('id')}** — "
                           f"{_md_cell(grow_first.get('role'), 120)}。採用判定ではありません。")
@@ -2937,6 +3131,7 @@ DEFAULT_CFG = {
     "proximity_llm_enabled": True,    # クラスタの theme/警告/未探索軸ラベル(失敗しても決定的注釈は残る)
     "proximity_sim_threshold": 0.45,  # char-bigram Jaccard のクラスタ閾値(cross-run 検知は 0.5)
     "grow_priority_enabled": True,    # Issue #61: 育てる順(LLM 推奨・要確認)。採用判定には使わない
+    "stage_engine": {"proximity": "", "research_priority": ""},  # "" = secondary。集合視点jobだけ指定可(#59)
     "lit_search_enabled": True, "lit_search_max_terms": 6,
     "lit_search_max_results": 5, "lit_search_timeout_sec": 15,
     "inspire_enabled": True,   # inspire_mode(always|trigger|off)未指定時はここから導出
@@ -3060,7 +3255,11 @@ def main():
         sys.exit(1)
     if live != list(charter["engines"]):
         log(run, f"  注意: 実行ファイル未解決の engine を除外 → 使用 engine {live}(要求 {charter['engines']})")
+    validate_stage_engine_config(cfg, live)
     charter["engines"] = live
+    charter["stage_engine"] = cfg.get("stage_engine") or {}
+    charter["session_scope"] = SESSION_SCOPE
+    write_json(run, "charter.json", charter)
     runner = make_runner_for(live[0], cfg)   # primary。セッションは初回 job で spawn される
 
     success = False
@@ -3071,19 +3270,19 @@ def main():
             print("候補が0件。engine/認証/timeout を確認(--engine mock で配管だけ検証可)。")
             sys.exit(1)
         log(run, "[3/8] PROXIMITY— within-run 重複検知・多様性(注釈のみ・棄却しない)")
-        cands = proximity(runner, cands, charter, cfg, run)
+        cands = proximity(cands, charter, cfg, run)
         log(run, "[4/8] RED-TEAM — 攻撃 -> 検証項目へ変換")
-        cands = redteam(runner, cands, cfg, run)
+        cands = redteam(cands, charter, cfg, run)
         log(run, "[5/8] REVISE   — 攻撃を受けて仮説を1回だけ改訂")
-        cands = revise(runner, cands, cfg, run)
+        cands = revise(cands, charter, cfg, run)
         log(run, "[6/8] VERIFY   — Tier0(形/文献/soundness/feasibility)")
-        cands = verify(runner, cands, cfg, run, mem)
+        cands = verify(cands, charter, cfg, run, mem)
         log(run, "[7/8] HARD GATE— 形不備など客観的な不備だけを捨て案台帳へ")
         survivors = hard_gate(cands, run)
         priority_for_next_round(survivors, charter["eval_axes"], run)   # 配分指針(#37)。採用判定ではない
         log(run, "[8/8] ARBITER  — 整理(勝者は選ばない)")
         arbiter(survivors, run, charter["eval_axes"], cfg)
-        research_priority(runner, charter, survivors, cfg, run)          # LLM 推奨・要確認(#61)。matrix には混ぜない
+        research_priority(charter, survivors, cfg, run)          # LLM 推奨・要確認(#61)。matrix には混ぜない
         build_hypothesis_graph(cands, run)          # lineage を graph artifact に集約(#35)
         write_candidate_reports(charter, cands, run, cfg)   # 候補別詳細レポート(#47)
         write_memory_suggestions(charter, cands, survivors, run, cfg)   # 記録候補の提案(#48・保存しない)
