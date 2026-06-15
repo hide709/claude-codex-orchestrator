@@ -22,7 +22,7 @@
 
 1. `ARCHITECTURE.md` — 設計・不変条件(§6)
 2. `README.md` — 動かし方・前提・未実装
-3. `config.json` — engine / model / 発想レンズ(案を出すときの見方・切り口) / 検索設定
+3. `config.json` — engine / engine_config(model等) / 発想レンズ(案を出すときの見方・切り口) / 検索設定
 4. 直近の `runs/<id>/REPORT.md`(あれば現状把握)
 5. 必要なら GitHub Issues(`todo` / `future` / `merge-prep` ラベル)
 
@@ -40,6 +40,8 @@
 `PLANNER → GENERATE(独立・並列) → PROXIMITY(重複・近い候補を注釈) → RED-TEAM(攻撃→検証項目に変換) → REVISE(1回改訂) → VERIFY(形 + arXiv/INSPIRE/NASA NTRS + soundness/feasibility) → HARD GATE(形不備など客観のみ) → ARBITER(整理・勝者を選ばない)`
 
 dual engine では、候補単位の `RED-TEAM` / `VERIFY` は生成 engine と別 engine に割り当てる。`PROXIMITY` / `research_priority` は集合を見る job なので `stage_engine` で指定できる。
+
+モデル指定は `engine_config` が正本。Codex と Claude はモデル名前空間が違うため、単一の flat `model` を provenance や report の正本として扱わない。旧 flat 設定は Codex 互換用にだけ読む。
 
 ## Work Loop(この repo を触る agent 向け)
 

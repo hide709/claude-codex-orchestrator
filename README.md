@@ -190,7 +190,10 @@ pip install -r requirements.txt
 - 現行の独立性は prompt-level です。同一 engine 内では常駐セッションを共有します(`session_scope=shared_engine_session`)。
 - `stage_engine.proximity` / `stage_engine.research_priority` で、候補集合全体を見る job の engine を明示指定できます。空文字なら secondary engine を使います。
 - `codex exec` や `claude -p` のような headless 実行は使いません。どちらも対話セッションとして起動します。
-- `reasoning_effort` と `service_tier` は Codex の対話起動時に `-c service_tier=...` / `-c model_reasoning_effort=...` として渡します。
+- 使用モデルは `engine_config` で engine ごとに指定します。例: `codex.model` は Codex に `-c model="..."`、`claude.model` は Claude Code に `--model ...` として渡します。空文字なら各 session の既定モデルを使います。
+- `engine_config.codex.reasoning_effort` と `engine_config.codex.service_tier` は Codex の対話起動時に `-c service_tier=...` / `-c model_reasoning_effort=...` として渡します。
+- 旧形式の flat な `model` / `reasoning_effort` / `service_tier` は後方互換として Codex にのみ読みます。Claude には Claude 用の `engine_config.claude.model` / `fallback_model` を指定してください。
+- モデル名そのものは事前検証しません。無効な名前は session 起動や job 失敗として `events.jsonl` / `status.json` / `run.log` に出ます。
 - `queue_poll_sec` と `queue_timeout_sec` は、LLM job の report を待つ間隔と上限時間です。`--timeout` で待ち時間を上書きできます。
 - 文献検索は config の provider 設定に従います。高速確認や offline 確認では `--no-lit-search` を使います。
 - Claude Code の初回 BypassPermissions 承認は手動で済ませておく必要があります。承認後は driven セッションで同じ確認が出ない前提です。

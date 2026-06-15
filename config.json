@@ -1,9 +1,10 @@
 {
   "engine": "dual",
   "engines": ["codex", "claude"],
-  "model": "gpt-5.5",
-  "reasoning_effort": "low",
-  "service_tier": "flex",
+  "engine_config": {
+    "codex": {"model": "", "reasoning_effort": "low", "service_tier": "flex"},
+    "claude": {"model": "", "fallback_model": ""}
+  },
   "concurrency": 4,
   "n_lenses": 4,
   "timeout_sec": 420,
@@ -32,7 +33,7 @@
     "queue_timeout_sec": "1 job の応答待ち上限(秒。--timeout で上書き)。",
     "session_warmup_sec": "対話セッション起動後、最初の job を渡すまでの待ち(秒)。",
     "inject_enter_delay_sec": "2個目以降の job 注入で、テキスト送信後に Enter を別送するまでの遅延(秒。ADR-001 の paste 回避)。",
-    "model_reasoning_service": "reasoning_effort/service_tier は codex の対話起動フラグ(-c service_tier / -c model_reasoning_effort)に渡す。model は各セッション側で選ぶため未使用。",
+    "engine_config": "engine ごとの対話起動フラグ。codex: model/reasoning_effort/service_tier、claude: model/fallback_model。model 空文字は session 既定。legacy flat model/reasoning_effort/service_tier は後方互換として codex のみに読まれる。",
     "grow_priority_enabled": "REPORT に『育てる順(LLM 推奨・要確認)』を出す。採用判定・hard gate・decision_matrix には使わない。",
     "stage_engine": "集合全体を見る proximity / research_priority だけ engine 固定可。空文字は secondary(engines[0] ではない方)を決定的に使う。generate/redteam/revise/verify は候補単位の cross 割当なのでここでは固定しない。",
     "n_lenses": "lenses の先頭から何個使うか。lens は候補を出すときの見方・切り口で、engine ではない。",

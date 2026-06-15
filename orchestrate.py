@@ -288,22 +288,87 @@ def engine_available(engine, cfg):
     return _resolve_engine_exe(engine, cfg) is not None
 
 
+ENGINE_CONFIG_KEYS = {
+    "codex": {"model", "reasoning_effort", "service_tier"},
+    "claude": {"model", "fallback_model"},
+}
+
+
+def _nonempty(v):
+    return None if v is None or v == "" else str(v)
+
+
+def _engine_setting(cfg, engine, key):
+    """Resolve per-engine setting with legacy flat config support.
+
+    Legacy flat model/reasoning_effort/service_tier are Codex-only: the old flat
+    model was a gpt-family name and must not be shown as a Claude model.
+    """
+    base = _base_engine(engine)
+    engine_config = cfg.get("engine_config") or {}
+    per_engine = engine_config.get(base) if isinstance(engine_config, dict) else {}
+    if isinstance(per_engine, dict):
+        v = _nonempty(per_engine.get(key))
+        if v is not None:
+            return v
+    if base == "codex":
+        legacy = {"model": "model", "reasoning_effort": "reasoning_effort",
+                  "service_tier": "service_tier"}
+        if key in legacy:
+            return _nonempty(cfg.get(legacy[key]))
+    return None
+
+
+def _engine_model(cfg, engine):
+    base = _base_engine(engine)
+    if base == "mock":
+        return "mock"
+    return _engine_setting(cfg, base, "model") or "session-default"
+
+
+def _engine_model_label(cfg, engine):
+    text = str(engine or "")
+    if "->" in text:
+        parts = [p.strip() for p in text.split("->") if p.strip()]
+        return " -> ".join(f"{_base_engine(p)}={_engine_model(cfg, p)}" for p in parts)
+    if text == "dual":
+        return _engine_models_summary(cfg, cfg.get("engines") or [])
+    return _engine_model(cfg, text)
+
+
+def _engine_models_summary(cfg, engines):
+    return " / ".join(f"{eng}={_engine_model(cfg, eng)}" for eng in _dedupe(engines)) or "session-default"
+
+
 def _engine_argv(engine, exe, seed, cfg):
     """対話(非 headless)起動の argv。低フリクション(無確認・workspace書込)で seed prompt を渡す。"""
     if engine == "codex":
         # ネスト環境で codex の windows sandbox spawn が失敗するため、サンドボックスを bypass
         # (worker は queue/ 内の read/write のみ。orchestrator は信頼コード)
-        # service_tier は config 駆動(#51): flex はプリエンプトされ得るため、quota 逼迫時に
-        # config.json で default へ切替えられるようにする(従来は flex がハードコードだった)
-        # `or` フォールバック: config に "service_tier": null / "" と書かれても
-        # service_tier=None のような壊れた引数を codex に渡さない(PR #54 の Copilot 指摘)
-        return [exe, "-c", f"service_tier={cfg.get('service_tier') or 'flex'}",
-                "-c", f"model_reasoning_effort={cfg.get('reasoning_effort') or 'low'}",
-                "--dangerously-bypass-approvals-and-sandbox", seed]
+        args = [exe]
+        model = _engine_setting(cfg, "codex", "model")
+        service_tier = _engine_setting(cfg, "codex", "service_tier")
+        reasoning_effort = _engine_setting(cfg, "codex", "reasoning_effort")
+        if model:
+            args += ["-c", f'model="{model}"']
+        if service_tier:
+            args += ["-c", f"service_tier={service_tier}"]
+        if reasoning_effort:
+            args += ["-c", f"model_reasoning_effort={reasoning_effort}"]
+        args += ["--dangerously-bypass-approvals-and-sandbox", seed]
+        return args
     if engine == "claude":
         # skip-permissions: BypassPermissions 承認は初回一度きり(~/.claude.json に記録)。
         # 承認済みなら以降プロンプト無し。rename 等シェルも write-execute プレーン内は無確認。
-        return [exe, "--dangerously-skip-permissions", seed]
+        args = [exe]
+        model = _engine_setting(cfg, "claude", "model")
+        fallback_model = _engine_setting(cfg, "claude", "fallback_model")
+        if model:
+            args += ["--model", model]
+        if fallback_model:
+            args += ["--fallback-model", fallback_model]
+        args += ["--dangerously-skip-permissions", seed]
+        return args
     raise ValueError(f"unknown engine {engine}")
 
 
@@ -753,6 +818,23 @@ def validate_stage_engine_config(cfg, live_engines):
             raise SystemExit(f"stage_engine で指定できる stage は {allowed} のみです: {stage}")
         if eng and eng not in live:
             raise SystemExit(f"stage_engine.{stage}={eng} は使用可能 engine に含まれていません: {sorted(live)}")
+
+
+def validate_engine_config(cfg, live_engines):
+    engine_config = {} if "engine_config" not in cfg or cfg.get("engine_config") is None else cfg.get("engine_config")
+    if not isinstance(engine_config, dict):
+        raise SystemExit("engine_config は object で指定してください")
+    for engine, settings in engine_config.items():
+        if engine not in ENGINE_CONFIG_KEYS:
+            allowed = ", ".join(sorted(ENGINE_CONFIG_KEYS))
+            raise SystemExit(f"engine_config で指定できる engine は {allowed} のみです: {engine}")
+        if not isinstance(settings, dict):
+            raise SystemExit(f"engine_config.{engine} は object で指定してください")
+        invalid = sorted(set(settings) - ENGINE_CONFIG_KEYS[engine])
+        if invalid:
+            allowed = ", ".join(sorted(ENGINE_CONFIG_KEYS[engine]))
+            raise SystemExit(
+                f"engine_config.{engine} で指定できる key は {allowed} のみです: {', '.join(invalid)}")
 
 
 # ----------------------------------------------------------------------------
@@ -1439,11 +1521,12 @@ def _git_commit():
 
 
 def provenance(run, cfg, stage, label, **extra):
+    engine = extra.get("engine", cfg["engine"])
     data = {
         "stage": stage,
         "worker": label,
-        "engine": cfg["engine"],
-        "model": cfg["model"],
+        "engine": engine,
+        "model": _engine_model_label(cfg, engine),
         "run_id": run["id"],
         "created": _now(),
         "repo_commit": run.get("commit", ""),
@@ -3093,7 +3176,7 @@ def report(charter, survivors, all_cands, run, cfg):
         f"- seed: **{charter['seed']}**",
         f"- constraints: {charter['constraints'] or '(なし)'}",
         *([f"- domain: {charter['domain']}"] if charter.get("domain") else []),
-        f"- engine: {run['engine']} / model: {run['model']}（生成 engine 内訳: {eng_bd}）",
+        f"- engine: {run['engine']} / models: {run['models']}（生成 engine 内訳: {eng_bd}）",
         f"- 生成 {len(all_cands)} / 残った候補 {len(survivors)} / 客観棄却 {len(all_cands)-len(survivors)}"
         + (f" / LLM 棄却推奨 {sum(1 for c in survivors if c.get('_llm_kill'))} 件(要人間確認)"
            if any(c.get("_llm_kill") for c in survivors) else ""),
@@ -3158,7 +3241,9 @@ def new_run(seed, cfg):
     for d in ("candidates", "reviews", "revised", "verdicts", "evidence"):
         (base / d).mkdir(exist_ok=True)
     return {"id": rid, "dir": base, "log": base / "log", "created": _now(),
-            "engine": cfg["engine"], "model": cfg["model"], "commit": _git_commit(),
+            "engine": cfg["engine"], "models": _engine_models_summary(cfg, cfg.get("engines") or []),
+            "engine_models": {eng: _engine_model(cfg, eng) for eng in _dedupe(cfg.get("engines") or [])},
+            "commit": _git_commit(),
             "_logbuf": [], "_fallbacks": []}
 
 
@@ -3181,8 +3266,12 @@ def log(run, msg):
 # main
 # ----------------------------------------------------------------------------
 DEFAULT_CFG = {
-    "engine": "dual", "engines": ["codex", "claude"], "model": "gpt-5.5", "reasoning_effort": "low",
-    "service_tier": "flex", "concurrency": 4, "n_lenses": 4, "timeout_sec": 420,
+    "engine": "dual", "engines": ["codex", "claude"],
+    "engine_config": {
+        "codex": {"model": "", "reasoning_effort": "low", "service_tier": "flex"},
+        "claude": {"model": "", "fallback_model": ""},
+    },
+    "concurrency": 4, "n_lenses": 4, "timeout_sec": 420,
     "lenses": ["analogy", "anomaly", "method-driven", "contrarian", "gap", "combination"],
     "eval_axes": ["novelty", "soundness", "feasibility", "significance"],
     "proximity_enabled": True,        # within-run 重複検知・多様性(#34。注釈のみ)
@@ -3287,6 +3376,7 @@ def main():
     if args.timeout:
         cfg["queue_timeout_sec"] = args.timeout
 
+    validate_engine_config(cfg, [])
     run = new_run(seed, cfg)
     global EVENTS
     EVENTS = EventLog(run["dir"])   # watchdog(#46): runs/<id>/{events.jsonl,status.json}
@@ -3316,6 +3406,9 @@ def main():
     validate_stage_engine_config(cfg, live)
     charter["engines"] = live
     charter["stage_engine"] = cfg.get("stage_engine") or {}
+    run["models"] = _engine_models_summary(cfg, live)
+    run["engine_models"] = {eng: _engine_model(cfg, eng) for eng in live}
+    charter["engine_models"] = run["engine_models"]
     charter["session_scope"] = SESSION_SCOPE
     write_json(run, "charter.json", charter)
     runner = make_runner_for(live[0], cfg)   # primary。セッションは初回 job で spawn される

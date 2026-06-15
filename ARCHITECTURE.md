@@ -105,7 +105,7 @@ Planner -> Generate(engine x 発想レンズ) -> Proximity -> Red-team -> Revise
 └─────────┘
 
 全ての受け渡しは Artifact Bus(ファイル)経由。自然言語チャットで合議しない。
-全成果物に provenance(worker/model/seed/commit)を刻印する。
+全成果物に provenance(worker/engine/model/seed/commit)を刻印する。model は単一の共通値ではなく、実際にその stage を処理した engine の設定値を記録する。
 ```
 
 ---
@@ -223,7 +223,7 @@ Planner -> Generate(engine x 発想レンズ) -> Proximity -> Red-team -> Revise
 ### 3.8 ARTIFACT BUS
 - **責務:** 全コンポーネント間の受け渡しをファイルで行う(YAML/MD/JSON/diff)。
 - **特性:** チャットなし。crash 耐性(ディスク永続)。デバッグ容易(ファイルを開けば履歴)。
-- **provenance:** 全成果物に worker / model / seed / commit を刻印 → 再現可能・監査可能。
+- **provenance:** 全成果物に worker / engine / model / seed / commit を刻印 → 再現可能・監査可能。Codex と Claude はモデル名前空間が違うため、model は `engine_config` から engine 別に解決する。
 
 ---
 
@@ -331,7 +331,7 @@ failure_condition: "この条件なら候補を見直す"  # 任意
 search_keywords: ["english keyword"]          # 任意。文献検索の recall 用
 changes: ["revise で何を変えたか"]             # 任意。revise の自己申告
 resolved_red_team_issues: ["潰した指摘"]       # 任意。revise の自己申告
-provenance: {worker: ..., engine: ..., model: ..., seed: ..., commit: ...} # orchestrator が付与
+provenance: {worker: ..., engine: ..., model: ..., seed: ..., commit: ...} # orchestrator が付与(model は engine 別)
 ```
 
 ### 7.2 Red-team review（attack の出力）
