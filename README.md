@@ -98,6 +98,8 @@ python orchestrate.py --seed "..." --constraints "公開データのみ。新規
 3. `decision_matrix.md`
    評価軸ごとの整理。勝者は選ばない。人間が比較するための表。
 
+生成される Markdown レポートは人間向けの日本語表示を使います。JSON の内部キーとの対応は [ARCHITECTURE.md §13](./ARCHITECTURE.md#13-用語集) を参照してください。
+
 4. `priority.json`
    次に検証する順番の正本。決定的計算で作る。採用判定ではない。
 
