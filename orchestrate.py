@@ -12,7 +12,8 @@ orchestrate.py — IDEA-stage funnel MVP   (see ARCHITECTURE.md §11)
   - VERIFIER は生成者と別呼び出し(独立)。red-team は judge しない(attack -> convert)。
   - soft score を単一値に潰さない。落選は捨て案台帳へ(消さない)。
 
-依存: Python 標準ライブラリのみ。engine は常駐 worker + queue 経由で呼ぶ。
+依存: orchestrator 本体は Python 標準ライブラリのみ。
+Windows で実 engine を対話駆動する場合だけ pywinpty を使う。
 """
 
 import argparse
@@ -37,6 +38,9 @@ PROMPTS_DIR = ROOT / "prompts"
 TEMPLATES_DIR = ROOT / "templates"
 MEMORY_DIR = ROOT / "memory"
 QUEUE_DIR = ROOT / "queue"
+
+SUPPORTED_ENGINES = ("codex", "claude", "mock")
+ENGINE_CHOICES = ("dual", *SUPPORTED_ENGINES)
 
 # ----------------------------------------------------------------------------
 # 発想レンズ (ARCHITECTURE §3.3 / 研究向け)
@@ -379,6 +383,8 @@ def _winpty_available():
 def engine_available(engine, cfg):
     """mock は常に可。codex/claude は Windows + pywinpty + 実行ファイル解決 が揃って初めて可
     (揃っていないのに _spawn まで進んで生 ImportError で落ちるのを防ぐ)。"""
+    if engine not in SUPPORTED_ENGINES:
+        return False
     if engine == "mock":
         return True
     if not _winpty_available():
@@ -829,8 +835,12 @@ def shutdown_runners():
 
 
 def usable_engines(engines, cfg):
-    """使える engine を順序保持で返す。mock は常に可、それ以外は実行ファイルが解決できる場合のみ。"""
+    """使える engine を順序保持で返す。未対応 engine は実行前に落とすので、ここでは usable だけ見る。"""
     return [e for e in engines if engine_available(e, cfg)]
+
+
+def unsupported_engines(engines):
+    return [e for e in _dedupe(engines) if e not in SUPPORTED_ENGINES]
 
 
 SESSION_SCOPE = "shared_engine_session"
@@ -3425,6 +3435,92 @@ def load_cfg(path):
     return cfg
 
 
+def _doctor_requested_engines(cfg):
+    return _dedupe(cfg.get("engines") or ["codex", "claude"]) if cfg.get("engine") == "dual" else [cfg.get("engine")]
+
+
+def _doctor_engine_status(engine, cfg):
+    if engine == "mock":
+        return {
+            "engine": "mock",
+            "usable": True,
+            "exe": "-",
+            "model": "mock",
+            "note": "LLM/pywinpty/login を使わない Python pipeline smoke 用",
+        }
+    if engine not in SUPPORTED_ENGINES:
+        return {
+            "engine": engine,
+            "usable": False,
+            "exe": "-",
+            "model": "-",
+            "note": "未対応 engine。codex / claude / mock のみ駆動できます",
+        }
+    exe = _resolve_engine_exe(engine, cfg)
+    if os.name != "nt":
+        note = "実 engine の対話駆動は Windows + pywinpty 前提。非 Windows は mock のみ"
+    elif not _winpty_available():
+        note = "pywinpty が import できない。Windows で pip install -r requirements.txt を実行"
+    elif not exe:
+        note = f"{engine} が PATH/既定場所で見つからない"
+    else:
+        note = "静的確認 OK。login 状態と初回承認は実 run で確認"
+    return {
+        "engine": engine,
+        "usable": engine_available(engine, cfg),
+        "exe": exe or "-",
+        "model": _engine_model(cfg, engine),
+        "note": note,
+    }
+
+
+def cmd_doctor(argv):
+    """Token を使わず、実 engine 起動前の静的 readiness を表示する。"""
+    ap = argparse.ArgumentParser(prog="orchestrate.py doctor")
+    ap.add_argument("--config", default=str(ROOT / "config.json"))
+    ap.add_argument("--engine", choices=ENGINE_CHOICES, help="config の engine を上書き")
+    ap.add_argument("--engines", help='dual 時の engine をカンマ区切りで上書き(例: "codex,claude" / "codex")')
+    args = ap.parse_args(argv)
+
+    cfg = load_cfg(args.config)
+    cfg["_config_path"] = str(Path(args.config).resolve()) if args.config else "(default)"
+    if args.engine:
+        cfg["engine"] = args.engine
+    if args.engines:
+        es = [e.strip() for e in args.engines.split(",") if e.strip()]
+        cfg["engines"] = es
+        cfg["engine"] = "dual" if len(es) > 1 else (es[0] if es else cfg.get("engine", "dual"))
+
+    try:
+        validate_engine_config(cfg, [])
+    except SystemExit as e:
+        print(f"config error: {e}", file=sys.stderr)
+        return 2
+
+    requested = _doctor_requested_engines(cfg)
+    statuses = [_doctor_engine_status(e, cfg) for e in requested]
+    usable = [s["engine"] for s in statuses if s["usable"]]
+
+    print("orchestrate.py doctor")
+    print(f"- config: {cfg.get('_config_path')}")
+    print(f"- python: {sys.version.split()[0]} ({sys.executable})")
+    print(f"- platform: {sys.platform} / os.name={os.name}")
+    print(f"- pywinpty: {'ok' if _winpty_available() else 'unavailable'}")
+    print(f"- requested engine: {cfg.get('engine')} -> {', '.join(requested)}")
+    print("")
+    print("| engine | usable | executable | model | note |")
+    print("|---|---|---|---|---|")
+    for s in statuses:
+        usable_text = "yes" if s["usable"] else "no"
+        print(f"| {s['engine']} | {usable_text} | {s['exe']} | {s['model']} | {s['note']} |")
+    print("")
+    print(f"usable engines: {', '.join(usable) if usable else '(none)'}")
+    print("")
+    print("mock は orchestrator の Python pipeline / artifact 生成だけを確認します。")
+    print("codex / claude の login 状態や Claude Code の初回承認は、doctor では起動しないため未確認です。")
+    return 0
+
+
 def main():
     for stream in (sys.stdout, sys.stderr):  # Windows cp932 でも Unicode で落ちないように
         try:
@@ -3438,13 +3534,16 @@ def main():
     # operator steering channel(Issue #53): 実行中 run への human note を artifact に残す
     if len(sys.argv) > 1 and sys.argv[1] == "steer":
         return cmd_steer(sys.argv[2:])
+    # 環境確認(Issue #75): token を使わず、pywinpty / executable 解決だけを見る
+    if len(sys.argv) > 1 and sys.argv[1] == "doctor":
+        sys.exit(cmd_doctor(sys.argv[2:]))
 
     ap = argparse.ArgumentParser(description="IDEA-stage funnel MVP (ARCHITECTURE §11)")
     ap.add_argument("--seed", help="研究の種(問い or hunch)")
     ap.add_argument("--seed-file", help="種をファイルから読む")
     ap.add_argument("--constraints", default="", help="制約(使える装置/データ/計算資源 等)")
     ap.add_argument("--config", default=str(ROOT / "config.json"))
-    ap.add_argument("--engine", choices=["dual", "codex", "claude", "mock"], help="config を上書き")
+    ap.add_argument("--engine", choices=ENGINE_CHOICES, help="config を上書き")
     ap.add_argument("--budget", choices=["quick", "normal", "deep"],
                     help="予算プロファイル(#37)。n_lenses 等を一括設定(明示 --n-lenses が優先)")
     ap.add_argument("--n-lenses", type=int, help="使う発想レンズ数(config を上書き)")
@@ -3490,6 +3589,12 @@ def main():
 
     log(run, "[1/8] PLANNER  — charter 固定")
     charter = planner(seed, args.constraints, cfg, run)
+    bad_engines = unsupported_engines(charter["engines"])
+    if bad_engines:
+        print("未対応 engine が指定されています: " + ", ".join(bad_engines))
+        print("  対応している engine: codex / claude / mock")
+        update_operator_state(run, "failed", reason="unsupported engine")
+        sys.exit(2)
     # 使える engine(実行ファイルが解決できるもの。mock は常に可)を確定。
     # セッションは orchestrator が pywinpty で spawn・駆動する(手動 worker 不要)。
     live = usable_engines(charter["engines"], cfg)
