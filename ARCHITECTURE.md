@@ -458,6 +458,8 @@ provenance には `session_scope: "shared_engine_session"` を記録する。こ
 
 ## 13. 用語集
 
+生成される人間向け Markdown では、JSON の内部キーを併記しない。JSON artifact を直接読む人向けの対応関係はこの節に集約する。
+
 | 用語 | 意味 |
 |---|---|
 | artifact | LLM や検証器が残すファイル成果物。判断はチャットではなく artifact を見る。 |
@@ -475,11 +477,31 @@ provenance には `session_scope: "shared_engine_session"` を記録する。こ
 | fallback | LLM job の失敗、timeout、出力不備を別 engine や既定値で補って run を止めずに続けた記録。`count > 0` の run は通常より注意して読む。 |
 | operator steering | 実行中に人間が注意点を artifact として追記する仕組み。evidence ではない。 |
 | session_scope | LLM セッション履歴の共有範囲。現行は `shared_engine_session` で、同一 engine 内では session-level の履歴を共有する。 |
-| 新しさ(novelty) | 既知研究との差。README や report ではこの日本語ラベルを使う。 |
-| 筋の良さ(soundness) | 物理・理屈として破綻していないか。 |
-| 実行しやすさ(feasibility) | 最初の検証に必要なデータ、計算、工数が現実的か。 |
-| impact / インパクト(significance) | 正しければどの程度役に立つか。 |
-| 最初に試す反証方法(cheapest_kill) | その候補を少ない手間で否定できるかを最初に見る確認。 |
+| `novelty` / 新しさ | 既知研究との差。 |
+| `soundness` / 理屈の妥当性 | 物理・理屈として破綻していないか。 |
+| `feasibility` / 実行しやすさ | 最初の検証に必要なデータ、計算、工数が現実的か。 |
+| `significance` / インパクト | 正しければどの程度役に立つか。 |
+| `mechanism_clarity` / 仕組みの明確さ | 物理・工学メカニズムが明確に述べられているか。 |
+| `validation_clarity` / 検証計画の明確さ | 最初の検証方法と成功・失敗条件が明確か。 |
+| `baseline_clarity` / 比較基準の明確さ | 比較すべき基準が明確か。 |
+| `novelty_claim` / 新しさの主張 | 最近接の先行研究と、本案が違う点。 |
+| `test_method` / 検証方法 | 最初にどう確かめるか。 |
+| `falsification` / 反証条件 | 何が観測・計算されれば候補を見直すか。 |
+| `cheapest_kill` / 最初に試す反証 | その候補を少ない手間で否定できるかを最初に見る確認。 |
+| `assumptions` / 前提 | 候補が成り立つために置いている条件。 |
+| `unknowns` / 未確認点 | まだ分からないこと。 |
+| `baseline` / 比較基準 | 比較すべき既存手法・基準。 |
+| `success_metric` / 成功条件 | 成功したと言える指標。 |
+| `failure_condition` / 失敗条件 | この条件なら候補を見直す、という条件。 |
+| `confidence` / 根拠の強さ | verifier の根拠の強さ。低/中/高で表す。 |
+| `prior_art` / 近い先行研究 | verifier が採用した近い先行研究。 |
+| `source_tier` / 出典の信頼度区分 | 権威DB、査読済み、preprint、一般web などの区分。 |
+| `priority_for_next_round` / 次に深掘りする優先度 | 追加検証の予算配分。採用判定ではない。 |
+| `hidden_assumption` / 隠れた前提 | red-team が見つけた未明示の前提。 |
+| `feasibility_hole` / 実現性の穴 | red-team が見つけた実行可能性の穴。 |
+| `contradicting_work` / 矛盾しうる先行研究 | red-team が指摘した、矛盾する可能性のある先行研究。 |
+| `confound` / 交絡・別説明 | 別要因で同じ結果が説明できる可能性。 |
+| `stronger_variant` / より強い別案 | red-team が提案した、より強い隣接候補。 |
 
 ---
 

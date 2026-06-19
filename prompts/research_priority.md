@@ -12,6 +12,9 @@
 以下の語は出力に使わない:
 winner / best / truth_score / final_rank / 本命
 
+出力文の `role` / `reason` / `note` では、入力 JSON の内部キー名をそのまま書かない。
+例えば `cheapest_kill` は「最初に試す反証」、`priority_for_next_round` は「次に深掘りする優先度」、`source_tier` は「出典の信頼度区分」のように日本語で説明する。
+
 # 観点
 - 研究テーマとしてまとまるか
 - 発展性があるか

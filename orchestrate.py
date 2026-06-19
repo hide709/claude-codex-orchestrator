@@ -150,18 +150,43 @@ AXIS_DESC = {
 }
 
 # ---------------------------------------------------------------------------
-# 人間向けラベル(Issue #47)。Markdown(decision_matrix / candidate_reports)だけで使い、
-# JSON artifact は内部キーのまま(正本)。内部キーは traceability のため括弧で併記する。
+# 人間向けラベル(Issue #47/#73)。Markdown(decision_matrix / candidate_reports)だけで使い、
+# JSON artifact は内部キーのまま(正本)。Markdown では内部キーを併記しない。
 # config の eval_axes_label で上書き/追加できる(domain 軸用)。
 # ---------------------------------------------------------------------------
+HUMAN_FIELD_LABEL = {
+    "question": "問い",
+    "hypothesis": "仮説",
+    "novelty_claim": "新しさの主張",
+    "soundness": "理屈の妥当性",
+    "falsification": "反証条件",
+    "test_method": "検証方法",
+    "feasibility": "実行しやすさ",
+    "significance": "インパクト",
+    "significance_if_true": "インパクト",
+    "risk_type": "主なリスク",
+    "cheapest_kill": "最初に試す反証",
+    "assumptions": "前提",
+    "unknowns": "未確認点",
+    "baseline": "比較基準",
+    "success_metric": "成功条件",
+    "failure_condition": "失敗条件",
+    "mechanism_clarity": "仕組みの明確さ",
+    "validation_clarity": "検証計画の明確さ",
+    "baseline_clarity": "比較基準の明確さ",
+    "confidence": "根拠の強さ",
+    "prior_art": "近い先行研究",
+    "source_tier": "出典の信頼度区分",
+    "priority_for_next_round": "次に深掘りする優先度",
+}
 AXIS_LABEL = {
-    "novelty":            "新しさ(novelty)",
-    "soundness":          "筋の良さ(soundness)",
-    "feasibility":        "実行しやすさ(feasibility)",
-    "significance":       "impact / インパクト(significance)",
-    "mechanism_clarity":  "機構の明確さ(mechanism_clarity)",
-    "validation_clarity": "検証の明確さ(validation_clarity)",
-    "baseline_clarity":   "基準比較の明確さ(baseline_clarity)",
+    "novelty":            "新しさ",
+    "soundness":          "理屈の妥当性",
+    "feasibility":        "実行しやすさ",
+    "significance":       "インパクト",
+    "mechanism_clarity":  "仕組みの明確さ",
+    "validation_clarity": "検証計画の明確さ",
+    "baseline_clarity":   "比較基準の明確さ",
 }
 CONF_LABEL = {"low": "低", "medium": "中", "high": "高"}
 TIER_LABEL = {"authoritative_db": "権威DB", "peer_reviewed": "査読済み",
@@ -171,12 +196,12 @@ ATTACK_LABEL = {
     "contradicting_work": "矛盾しうる先行研究",
     "feasibility_hole":   "実現性の穴",
     "confound":           "交絡・別説明",
-    "stronger_variant":   "より強い変種の提案",
+    "stronger_variant":   "より強い別案",
 }
 # convert_to → (確認方法の表示名, 現 pipeline での実施状況)。
 # 実施状況は決定的に言えることだけ書く(等級の捏造をしない / Issue #47 レビュー方針)。
 CONVERT_LABEL = {
-    "assumption":        ("前提として明示", "対応済み(assumptions に追記)"),
+    "assumption":        ("前提として明示", "対応済み(前提に追記)"),
     "lit_check":         ("文献確認", "検索実施済み(評価は verifier 引用参照)"),
     "computation":       ("計算で確認", "提案のみ(toy 実行は未実装 / #17)"),
     "falsification_fix": ("検証法の改訂", "提案のみ(revise で反映の可能性 / 改訂版参照)"),
@@ -184,8 +209,81 @@ CONVERT_LABEL = {
 }
 
 
+INTERNAL_IDENTIFIER_LABEL = {
+    "cheapest_kill": HUMAN_FIELD_LABEL["cheapest_kill"],
+    "novelty_claim": HUMAN_FIELD_LABEL["novelty_claim"],
+    "test_method": HUMAN_FIELD_LABEL["test_method"],
+    "success_metric": HUMAN_FIELD_LABEL["success_metric"],
+    "failure_condition": HUMAN_FIELD_LABEL["failure_condition"],
+    "priority_for_next_round": HUMAN_FIELD_LABEL["priority_for_next_round"],
+    "source_tier": HUMAN_FIELD_LABEL["source_tier"],
+    "risk_type": HUMAN_FIELD_LABEL["risk_type"],
+    "hidden_assumption": ATTACK_LABEL["hidden_assumption"],
+    "feasibility_hole": ATTACK_LABEL["feasibility_hole"],
+    "contradicting_work": ATTACK_LABEL["contradicting_work"],
+    "stronger_variant": ATTACK_LABEL["stronger_variant"],
+    "mechanism_clarity": HUMAN_FIELD_LABEL["mechanism_clarity"],
+    "validation_clarity": HUMAN_FIELD_LABEL["validation_clarity"],
+    "baseline_clarity": HUMAN_FIELD_LABEL["baseline_clarity"],
+    "uncertainty_low_axes": "根拠の弱い観点",
+    "uncertainty_med_axes": "中程度の不確実性",
+    "open_unknowns": "未確認点",
+    "flag_attention": "要注目",
+    "llm_kill_review": "LLM棄却推奨の確認",
+    "cluster_non_representative": "同方向の代表候補あり",
+    "past_duplicate": "過去runとの類似",
+}
+
+
+def _strip_internal_key_annotations(label):
+    label_keys = set(INTERNAL_IDENTIFIER_LABEL) | set(AXIS_LABEL) | set(HUMAN_FIELD_LABEL)
+    keys = "|".join(re.escape(k) for k in sorted(label_keys, key=len, reverse=True))
+    return re.sub(rf"\(({keys})\)", "", str(label or "")).strip()
+
+
 def axis_label(ax, cfg=None):
-    return ((cfg or {}).get("eval_axes_label") or {}).get(ax) or AXIS_LABEL.get(ax, ax)
+    raw = ((cfg or {}).get("eval_axes_label") or {}).get(ax) or AXIS_LABEL.get(ax, ax)
+    return _strip_internal_key_annotations(raw)
+
+
+def field_label(key):
+    return HUMAN_FIELD_LABEL.get(key, key)
+
+
+def human_action_label(action, cfg=None):
+    labels = {
+        "deeper-lit-search": "文献をさらに確認",
+        "soundness-derivation-check": "理屈を確認",
+        "toy-computation": "小さな計算で確認",
+        "human-judgement": "人間が判断",
+        "human-review-kill-reason": "棄却推奨の理由を人間が確認",
+        "extra-redteam": "追加で批判的に確認",
+        "baseline-only": "比較基準だけ確認",
+    }
+    text = str(action or "-").strip().strip("`").strip()
+    m = re.fullmatch(r"extra-verification\(([^)]+)\)", text)
+    if m:
+        return f"追加で確認: {axis_label(m.group(1), cfg)}"
+    return labels.get(text, text)
+
+
+def human_next_action_label(value, cfg=None):
+    text = str(value or "-").strip()
+    if "→" in text:
+        left, right = text.split("→", 1)
+        return f"{left.strip()} → {human_action_label(right.strip(), cfg)}"
+    return human_action_label(text, cfg)
+
+
+def scrub_human_text(text):
+    """Markdown view 用。自由文では snake_case 等の内部識別子だけを置換する。
+    baseline/significance/confidence/confound 等の一般英単語は、科学文脈の誤置換を避けるため触らない。"""
+    out = str(text or "")
+    for bad, good in INTERNAL_IDENTIFIER_LABEL.items():
+        pat = rf"(?<![A-Za-z0-9_]){re.escape(bad)}(?![A-Za-z0-9_])"
+        out = re.sub(pat, good, out)
+    return out
+
 
 
 def verdict_schema(axes):
@@ -690,7 +788,7 @@ class MockRunner:
         if kind == "verdict":
             v = "kill" if idx == 1 else ("flag" if idx % 2 == 0 else "keep")  # 1件は kill で gate を検証
             # 軸は渡された schema から導出(eval_axes が config 駆動になったため / Issue #40)
-            out = {ax: {"assessment": f"{ax} 良好（mock）",
+            out = {ax: {"assessment": f"{axis_label(ax)}は良好（mock）",
                         "confidence": ["low", "medium"][i % 2]}
                    for i, (ax, p) in enumerate(schema.get("properties", {}).items())
                    if isinstance(p, dict) and "assessment" in p.get("properties", {})}
@@ -2260,14 +2358,24 @@ def fallback_badge(c):
     return "劣化あり(fallback: " + ", ".join(stages) + ")"
 
 
+def verdict_label(verdict):
+    text = str(verdict or "?")
+    return {
+        "keep": "継続候補",
+        "flag": "要注目",
+        "kill": "棄却推奨",
+        "kill?(LLM/要確認)": "LLM棄却推奨(要人間確認)",
+    }.get(text, text)
+
+
 def candidate_status(c):
     v = c.get("_verdict", {}) or {}
     if v.get("_form_fail"):
         base = "客観棄却(形式不備)"
     elif c.get("_llm_kill"):
-        base = "kill?(LLM/要人間確認)"
+        base = verdict_label("kill?(LLM/要確認)")
     else:
-        base = {"keep": "継続候補", "flag": "要注目(flag)"}.get(v.get("verdict"), v.get("verdict", "?"))
+        base = verdict_label(v.get("verdict"))
     fb = fallback_badge(c)
     return base if fb == "-" else f"{base} / {fb}"
 
@@ -2294,8 +2402,8 @@ def _priority_by_id(run):
 PRIORITY_BREAKDOWN_LABEL = {
     "uncertainty_low_axes": "根拠の弱い観点が多い",
     "uncertainty_med_axes": "中程度の不確実性が残る",
-    "open_unknowns": "未解決の unknowns がある",
-    "flag_attention": "要注目(flag)の確認が必要",
+    "open_unknowns": "未確認点が残っている",
+    "flag_attention": "要注目の確認が必要",
     "llm_kill_review": "LLM 棄却推奨の確認が必要",
     "cluster_non_representative": "同方向の代表候補がある",
     "past_duplicate": "過去 run と似ている",
@@ -2307,7 +2415,7 @@ def _priority_reason(row):
     pos = [(k, v) for k, v in bd.items() if isinstance(v, (int, float)) and v > 0]
     pos.sort(key=lambda kv: (-kv[1], kv[0]))
     if not pos:
-        return "baseline 継続"
+        return "比較基準の確認を継続"
     return " / ".join(PRIORITY_BREAKDOWN_LABEL.get(k, k) for k, _ in pos[:2])
 
 
@@ -2321,8 +2429,8 @@ def _one_line(c, *keys, limit=180):
     return "-"
 
 
-def _onepager_markdown(template, c):
-    next_action = (f"{c.get('_priority','-')} → `{c.get('_next_action','-')}`"
+def _onepager_markdown(template, c, cfg=None):
+    next_action = (f"{c.get('_priority','-')} → {c.get('_next_action','-')}"
                    if "_priority" in c else "-")
     return render(
         template,
@@ -2331,7 +2439,7 @@ def _onepager_markdown(template, c):
         first_kill=_one_line(c, "cheapest_kill", "falsification", limit=260),
         if_falsified=_one_line(c, "failure_condition", "falsification", limit=260),
         status=candidate_status(c),
-        next_action=next_action,
+        next_action=human_next_action_label(next_action, cfg),
     ).strip()
 
 
@@ -2344,7 +2452,7 @@ def arbiter(survivors, run, axes=None, cfg=None):
 
     def cell(v, axis):
         a = v.get(axis, {})
-        txt = str(a.get("assessment", "-")).replace("\n", " ").replace("|", "/")
+        txt = scrub_human_text(a.get("assessment", "-")).replace("\n", " ").replace("|", "/")
         if len(txt) > 90:
             txt = txt[:90].rstrip() + "…"   # 全文は verdicts/*.json に残す
         return f"{txt} [{a.get('confidence','-')}]"
@@ -2376,30 +2484,30 @@ def arbiter(survivors, run, axes=None, cfg=None):
     rows.sort(key=score)
     write_json(run, "decision_matrix.json", rows)
 
-    labels = [axis_label(ax, cfg) for ax in axes]   # 人間向けラベル(内部キー併記 / #47)
-    header_cols = ["id", "発想レンズ", "クラスタ", "engine", "状態(verdict)"]
+    labels = [axis_label(ax, cfg) for ax in axes]   # 人間向けラベル(#47/#73)
+    header_cols = ["id", "発想レンズ", "クラスタ", "engine", "状態"]
     if show_fallback:
         header_cols.append("fallback警告")
-    header_cols += ["リスク種別", *labels, "最初に試す反証方法(cheapest_kill)", "next_round(配分)"]
+    header_cols += ["主なリスク", *labels, "最初に試す反証", "次に深掘りする優先度"]
     header = "| " + " | ".join(header_cols) + " |"
     sep = "|" + "---|" * len(header_cols)
     md = ["# decision_matrix (人間が読む)\n",
           "**勝者は選んでいない。** AIは候補を出し客観検証しただけ。",
           "どの残った候補に *実験予算* を割くかは人間が決める(ARCHITECTURE §3.7 / §5)。",
           "各候補の詳細・出典は `candidate_reports.md` を参照(#47)。\n",
-          "状態(verdict)凡例: `keep` / `flag`(通説違反など要注目で残す) / "
-          "`kill?(LLM/要確認)`=LLM は kill 推奨だが客観未確認 → 人間が棄却の妥当性を判断。\n",
-          "next_round(配分)凡例: 次ラウンドで**追加**の検証予算をどこに使うかの決定的な指針"
+          "状態凡例: 継続候補 / 要注目 / LLM棄却推奨(要人間確認)。"
+          "LLM の棄却推奨は客観未確認なので、人間が棄却の妥当性を判断。\n",
+          "次に深掘りする優先度: 次ラウンドで**追加**の検証予算をどこに使うかの決定的な指針"
           "(`priority.json` に内訳)。**採用判定ではない** — 低くても棄却されない(floor / #37)。\n",
           header, sep]
     for r in rows:
-        cells = [r["id"], r["lens"], r["cluster"], r["engine"], r["verdict"]]
+        cells = [r["id"], r["lens"], r["cluster"], r["engine"], verdict_label(r["verdict"])]
         if show_fallback:
             cells.append(r["fallback_warning"])
-        cells.append(r["risk_type"])
+        cells.append(axis_label(r["risk_type"], cfg))
         cells += [r[ax] for ax in axes]
-        cells += [r["cheapest_kill"], r.get("next_round", "-")]
-        md.append("| " + " | ".join(str(x).replace("|", "/").replace("\n", " ") for x in cells) + " |")
+        cells += [r["cheapest_kill"], human_next_action_label(r.get("next_round", "-"), cfg)]
+        md.append("| " + " | ".join(_md_cell(x) for x in cells) + " |")
     md.append("\n## 各候補の仮説\n")
     for r in rows:
         md.append(f"- **{r['id']}** ({r['lens']}): {r['hypothesis']}")
@@ -2450,25 +2558,26 @@ def build_hypothesis_graph(cands, run):
 
     md = ["# hypothesis graph (lineage / 人間が読む)\n",
           "各仮説が seed → 生成 → red-team 攻撃 → 改訂 → 検証 とどう育ったか。"
-          "`resolved` は revise 時の **LLM 自己申告**(検証済み事実ではない)。\n"]
+          "`対応済み` は改訂時の **LLM 自己申告**(検証済み事実ではない)。\n"]
     for c in cands:
         cid = c["id"]
         lin = c.get("_lineage", {})
         v = c.get("_verdict", {}) or {}
-        status = ("discarded(form)" if v.get("_form_fail")
-                  else "kill?(LLM/要確認)" if c.get("_llm_kill") else v.get("verdict", "?"))
+        status = ("客観棄却(形式不備)" if v.get("_form_fail")
+                  else verdict_label("kill?(LLM/要確認)") if c.get("_llm_kill") else verdict_label(v.get("verdict", "?")))
         n_att = len((c.get("_review") or {}).get("attacks", []))
-        res = lin.get("resolved_red_team_issues", [])
+        res = [scrub_human_text(x) for x in (lin.get("resolved_red_team_issues", []) or [])]
+        op = {"revise": "改訂", "generate": "生成"}.get(lin.get("operator", "revise"), lin.get("operator", "改訂"))
         md.append(f"- **{cid}** [{c.get('_lens','?')} / {c.get('_engine','?')} / "
                   f"cluster {c.get('_cluster_id','-')}] "
-                  f"seed → v0 → 攻撃{n_att}件 → {lin.get('operator','revise')} → v1 → **{status}**"
-                  + (f" / resolved(自己申告): {', '.join(res[:4])}" if res else ""))
+                  f"seed → v0 → 攻撃{n_att}件 → {op} → v1 → **{status}**"
+                  + (f" / 対応済み(自己申告): {', '.join(res[:4])}" if res else ""))
     write_text(run, "hypothesis_graph.md", "\n".join(md))
 
 
 def _md_cell(x, n=400):
     """Markdown テーブルセル用に整形(パイプ・改行を潰し、長文は切って正本 JSON へ誘導)。"""
-    t = str(x if x not in (None, "") else "-").replace("|", "/").replace("\n", " ")
+    t = scrub_human_text(x if x not in (None, "") else "-").replace("|", "/").replace("\n", " ")
     return (t[:n].rstrip() + "…") if len(t) > n else t
 
 
@@ -2532,7 +2641,7 @@ def _verification_order_table(survivors, run):
             str(i),
             _md_cell(row.get("id")),
             _md_cell(candidate_status(c) if c else row.get("verdict", "-"), 80),
-            _md_cell(row.get("recommended_next_action", "-"), 120),
+            _md_cell(human_action_label(row.get("recommended_next_action", "-")), 120),
             str(row.get("priority_for_next_round", "-")),
             _md_cell(_priority_reason(row), 160),
         ]) + " |")
@@ -2574,8 +2683,8 @@ def _first_actions(survivors, run):
     md = []
     for i, row in enumerate(rows[:3], 1):
         c = by_id.get(row.get("id"), {})
-        md.append(f"{i}. **{row.get('id')}**: `{row.get('recommended_next_action', '-')}` — "
-                  f"最初に試す反証方法: "
+        md.append(f"{i}. **{row.get('id')}**: `{human_action_label(row.get('recommended_next_action', '-'))}` — "
+                  f"最初に試す反証: "
                   f"{_md_cell(c.get('cheapest_kill', 'candidate_reports.md を参照'), 180)}")
     return "\n".join(md) if md else "- 候補なし。"
 
@@ -2630,7 +2739,7 @@ def _search_quality_section(run, cands, cfg, charter):
         ]) + " |")
     if adopted.get("unknown"):
         md.append(f"\n- provider を決定できない verifier 採用文献: {adopted['unknown']} 件"
-                  "（source_tier は保持、provider 推定はしない）")
+                  "（出典の信頼度区分は保持、provider 推定はしない）")
     return "\n".join(md)
 
 
@@ -2721,7 +2830,7 @@ def _scrub_research_priority_text(text):
     out = str(text or "")
     for bad, good in BANNED_RESEARCH_PRIORITY.items():
         out = re.sub(re.escape(bad), good, out, flags=re.IGNORECASE)
-    return _SECRET_RE.sub("[REDACTED]", out)
+    return _SECRET_RE.sub("[REDACTED]", scrub_human_text(out))
 
 
 def _next_round_notes_text(run):
@@ -2825,7 +2934,7 @@ def research_priority(charter, survivors, cfg, run):
 
 def write_candidate_reports(charter, cands, run, cfg):
     """候補ごとの詳細・評価・出典を1つの Markdown に集約(Issue #47)。
-    JSON artifact が正本で、これは人間向け view。内部キーは括弧で併記(用語対応表は末尾)。
+    JSON artifact が正本で、これは人間向け view。Markdown では内部キーを併記しない。
     AI の指摘(red-team)は evidence と混ぜない。出典の無い主張は「未検証」と明示する。
     検証状況は現 pipeline が客観的に言えることだけ書く(等級の捏造をしない)。"""
     axes = charter["eval_axes"]
@@ -2894,7 +3003,6 @@ def write_candidate_reports(charter, cands, run, cfg):
           "- **AI の指摘(red-team)は根拠(evidence)ではない** — 確認すべき論点として読む。",
           "- 出典の無い主張は「未検証」のまま明示する(検証されたように見せない)。",
           "- 「次に深掘りする優先度」は追加検証の予算配分であり、**採用/棄却の判定ではない**(低くても棄却されない)。",
-          "- 内部キー(英語)との対応は末尾の用語対応表を参照。",
           "",
           "## 候補一覧"]
     summary_header = ["ID", "問い", "生成engine", "検証engine", "発想レンズ", "クラスタ", "状態"]
@@ -2909,7 +3017,7 @@ def write_candidate_reports(charter, cands, run, cfg):
         if show_fallback:
             cells.append(fallback_summary(c))
         cells += [
-            (f'{c["_priority"]} → {c.get("_next_action","-")}' if "_priority" in c else "-"),
+            (human_next_action_label(f'{c["_priority"]} → {c.get("_next_action","-")}', cfg) if "_priority" in c else "-"),
             weakest(c)]
         md.append("| " + " | ".join(cells) + " |")
     md.append("")
@@ -2918,29 +3026,30 @@ def write_candidate_reports(charter, cands, run, cfg):
         cid = c["id"]
         v = c.get("_verdict", {}) or {}
         lin = c.get("_lineage", {}) or {}
+        op_label = {"revise": "改訂", "generate": "生成"}.get(lin.get("operator", "revise"), lin.get("operator", "改訂"))
         md += [f"---\n\n## {cid}: {_md_cell(c.get('question',''), 120)}\n",
                f"**状態: {status_of(c)}**\n",
-               _onepager_markdown(onepager_template, c),
+               _onepager_markdown(onepager_template, c, cfg),
                "",
                *fallback_rows(c),
                "### 1. 案の内容",
                "| 項目 | 内容 |", "|---|---|",
-               f"| 問い(question) | {_md_cell(c.get('question'))} |",
-               f"| 仮説(hypothesis) | {_md_cell(c.get('hypothesis'))} |",
-               f"| 新しさの主張(novelty_claim) | {_md_cell(c.get('novelty_claim'))} |",
-               f"| 理屈の説明(soundness) | {_md_cell(c.get('soundness'))} |",
-               f"| 検証方法(test_method) | {_md_cell(c.get('test_method'))} |",
-               f"| 反証条件(falsification) | {_md_cell(c.get('falsification'))} |",
-               f"| 比較基準(baseline) | {_md_cell(c.get('baseline'))} |",
-               f"| 成功指標(success_metric) | {_md_cell(c.get('success_metric'))} |",
-               f"| 失敗条件(failure_condition) | {_md_cell(c.get('failure_condition'))} |",
-               f"| 最初に試す反証方法(cheapest_kill) | {_md_cell(c.get('cheapest_kill'))} |",
-               f"| 前提(assumptions) | {_md_cell('; '.join(c.get('assumptions') or []))} |",
-               f"| 未知の点(unknowns) | {_md_cell('; '.join(c.get('unknowns') or []))} |",
+               f"| {field_label('question')} | {_md_cell(c.get('question'))} |",
+               f"| {field_label('hypothesis')} | {_md_cell(c.get('hypothesis'))} |",
+               f"| {field_label('novelty_claim')} | {_md_cell(c.get('novelty_claim'))} |",
+               f"| {field_label('soundness')} | {_md_cell(c.get('soundness'))} |",
+               f"| {field_label('test_method')} | {_md_cell(c.get('test_method'))} |",
+               f"| {field_label('falsification')} | {_md_cell(c.get('falsification'))} |",
+               f"| {field_label('baseline')} | {_md_cell(c.get('baseline'))} |",
+               f"| {field_label('success_metric')} | {_md_cell(c.get('success_metric'))} |",
+               f"| {field_label('failure_condition')} | {_md_cell(c.get('failure_condition'))} |",
+               f"| {field_label('cheapest_kill')} | {_md_cell(c.get('cheapest_kill'))} |",
+               f"| {field_label('assumptions')} | {_md_cell('; '.join(c.get('assumptions') or []))} |",
+               f"| {field_label('unknowns')} | {_md_cell('; '.join(c.get('unknowns') or []))} |",
                "",
                "### 2. 系譜・重複",
                f"- 生成: レンズ `{c.get('_lens','?')}` / engine `{c.get('_engine','?')}` / "
-               f"操作 `{lin.get('operator','?')}`(round {lin.get('generation_round', 0)})",
+               f"操作 `{op_label}`(round {lin.get('generation_round', 0)})",
                f"- クラスタ: `{c.get('_cluster_id','-')}`"
                + (f"(代表 `{c['_cluster_rep']}` と同方向)" if c.get("_cluster_rep") else "(代表)" if c.get("_cluster_id") else ""),
                *( [f"- 過去 run と類似: {c['_near_dup']['run']}/{c['_near_dup']['id']}(bigram {c['_near_dup']['score']})"]
@@ -2983,9 +3092,9 @@ def write_candidate_reports(charter, cands, run, cfg):
             if prov in ev:
                 md.append(f"| 文献検索: {prov_names[prov]} | {_provider_status(prov, ev[prov])} |")
         if has_missing_verify_fallback(c):
-            md.append("| verifier | **未検証(fallback)**: verifier 失敗。verdict は flag として継続し、全観点 low confidence |")
+            md.append("| verifier | **未検証(fallback)**: verifier 失敗。要注目として継続し、全観点の根拠の強さは低 |")
         elif has_retry_success_fallback(c):
-            md.append("| verifier | **self-review(fallback)**: cross engine が失敗し生成 engine が審査。verdict は存在するが、cross での再確認が望ましい |")
+            md.append("| verifier | **self-review(fallback)**: cross engine が失敗し生成 engine が審査。検証結果は存在するが、cross での再確認が望ましい |")
         md += ["| toy 計算・シミュレーション実行 | 未実施(実行系は未実装 / #17) |",
                "| 負例・対照チェック | 未実施 |"]
 
@@ -3002,14 +3111,15 @@ def write_candidate_reports(charter, cands, run, cfg):
         unproven = []
         if not pa:
             # 空の理由は断定できない(ヒット不採用/検索無効/ヒット無し のいずれもありうる)
-            unproven.append("新しさの主張(novelty_claim)— verifier が採用した近い先行研究が無く"
+            unproven.append("新しさの主張— verifier が採用した近い先行研究が無く"
                             "**未検証(要確認)**(検索の実施状況は上表、生データは evidence/*.json)")
-        unproven.append("実行しやすさ(feasibility)— 机上評価のみ(計算未実施)")
+        unproven.append("実行しやすさ— 机上評価のみ(計算未実施)")
         md += ["", "**根拠がまだ無い主張**: " + " / ".join(unproven),
                "", "### 7. 次の一手",
                f"- 次に深掘りする優先度(配分・採用判定ではない): "
-               f"{c.get('_priority','-')} → `{c.get('_next_action','-')}`(内訳は `priority.json`)",
-               f"- 最初に試す反証方法: {_md_cell(c.get('cheapest_kill'))}",
+               f"{human_next_action_label(str(c.get('_priority','-')) + ' → ' + str(c.get('_next_action','-')), cfg)}"
+               "(内訳は `priority.json`)",
+               f"- 最初に試す反証: {_md_cell(c.get('cheapest_kill'))}",
                "",
                "### Traceability",
                f"`candidates/{cid}.json` → `reviews/{cid}.json` → `revised/{cid}.json` → "
@@ -3022,15 +3132,6 @@ def write_candidate_reports(charter, cands, run, cfg):
            "| 文献検索 | 既に知られている話ではないか | arXiv/INSPIRE/NTRS を自動検索 → verifier が関係を評価 |",
            "| 計算で確認 | 桁・実現性が合うか | **提案のみ**(toy 実行は未実装 / #17) |",
            "| 負例・対照チェック | 偶然や別要因ではないか | **未実施**(次ラウンド以降の人間/将来実装) |",
-           "",
-           "## 用語対応表(内部キー → このレポートの表現)",
-           "| 内部キー | 表現 |", "|---|---|",
-           *[f"| `{ax}` | {lab[ax]} |" for ax in axes],
-           "| `cheapest_kill` | 最初に試す反証方法 |",
-           "| `confidence` | 根拠の強さ(低/中/高) |",
-           "| `priority_for_next_round` | 次に深掘りする優先度(追加検証の配分。採用判定ではない) |",
-           "| `prior_art` | 近い先行研究 |",
-           "| `source_tier` | 出典の信頼度区分(権威DB > 査読済み > preprint > 一般web) |",
            ""]
     write_text(run, "candidate_reports.md", "\n".join(md))
     log(run, f"  candidate_reports.md: {len(cands)} 候補の詳細・評価・出典を出力(#47)")
@@ -3148,15 +3249,15 @@ def write_memory_suggestions(charter, cands, survivors, run, cfg):
 
 
 def write_unresolved(cands, run):
-    lines = ["# 未解決論点 (unresolved)\n", "## 未追跡の stronger_variant\n"]
+    lines = ["# 未解決論点\n", "## 未追跡のより強い別案\n"]
     for v in run.get("variants", []):
-        lines.append(f"- ({v['from']} 由来) {v['claim']}")
+        lines.append(f"- ({v['from']} 由来) {scrub_human_text(v['claim'])}")
     if not run.get("variants"):
         lines.append("_(なし)_")
-    lines.append("\n## 各候補の unknowns\n")
+    lines.append("\n## 各候補の未確認点\n")
     for c in cands:
         for u in c.get("unknowns", []):
-            lines.append(f"- ({c['id']}) {u}")
+            lines.append(f"- ({c['id']}) {scrub_human_text(u)}")
     write_text(run, "unresolved.md", "\n".join(lines))
 
 
