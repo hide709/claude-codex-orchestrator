@@ -39,6 +39,9 @@ TEMPLATES_DIR = ROOT / "templates"
 MEMORY_DIR = ROOT / "memory"
 QUEUE_DIR = ROOT / "queue"
 
+SUPPORTED_ENGINES = ("codex", "claude", "mock")
+ENGINE_CHOICES = ("dual", *SUPPORTED_ENGINES)
+
 # ----------------------------------------------------------------------------
 # 発想レンズ (ARCHITECTURE §3.3 / 研究向け)
 # ----------------------------------------------------------------------------
@@ -282,6 +285,8 @@ def _winpty_available():
 def engine_available(engine, cfg):
     """mock は常に可。codex/claude は Windows + pywinpty + 実行ファイル解決 が揃って初めて可
     (揃っていないのに _spawn まで進んで生 ImportError で落ちるのを防ぐ)。"""
+    if engine not in SUPPORTED_ENGINES:
+        return False
     if engine == "mock":
         return True
     if not _winpty_available():
@@ -732,8 +737,12 @@ def shutdown_runners():
 
 
 def usable_engines(engines, cfg):
-    """使える engine を順序保持で返す。mock は常に可、それ以外は実行ファイルが解決できる場合のみ。"""
+    """使える engine を順序保持で返す。未対応 engine は実行前に落とすので、ここでは usable だけ見る。"""
     return [e for e in engines if engine_available(e, cfg)]
+
+
+def unsupported_engines(engines):
+    return [e for e in _dedupe(engines) if e not in SUPPORTED_ENGINES]
 
 
 SESSION_SCOPE = "shared_engine_session"
@@ -3338,6 +3347,14 @@ def _doctor_engine_status(engine, cfg):
             "model": "mock",
             "note": "LLM/pywinpty/login を使わない Python pipeline smoke 用",
         }
+    if engine not in SUPPORTED_ENGINES:
+        return {
+            "engine": engine,
+            "usable": False,
+            "exe": "-",
+            "model": "-",
+            "note": "未対応 engine。codex / claude / mock のみ駆動できます",
+        }
     exe = _resolve_engine_exe(engine, cfg)
     if os.name != "nt":
         note = "実 engine の対話駆動は Windows + pywinpty 前提。非 Windows は mock のみ"
@@ -3360,7 +3377,7 @@ def cmd_doctor(argv):
     """Token を使わず、実 engine 起動前の静的 readiness を表示する。"""
     ap = argparse.ArgumentParser(prog="orchestrate.py doctor")
     ap.add_argument("--config", default=str(ROOT / "config.json"))
-    ap.add_argument("--engine", choices=["dual", "codex", "claude", "mock"], help="config の engine を上書き")
+    ap.add_argument("--engine", choices=ENGINE_CHOICES, help="config の engine を上書き")
     ap.add_argument("--engines", help='dual 時の engine をカンマ区切りで上書き(例: "codex,claude" / "codex")')
     args = ap.parse_args(argv)
 
@@ -3425,7 +3442,7 @@ def main():
     ap.add_argument("--seed-file", help="種をファイルから読む")
     ap.add_argument("--constraints", default="", help="制約(使える装置/データ/計算資源 等)")
     ap.add_argument("--config", default=str(ROOT / "config.json"))
-    ap.add_argument("--engine", choices=["dual", "codex", "claude", "mock"], help="config を上書き")
+    ap.add_argument("--engine", choices=ENGINE_CHOICES, help="config を上書き")
     ap.add_argument("--budget", choices=["quick", "normal", "deep"],
                     help="予算プロファイル(#37)。n_lenses 等を一括設定(明示 --n-lenses が優先)")
     ap.add_argument("--n-lenses", type=int, help="使う発想レンズ数(config を上書き)")
@@ -3471,6 +3488,12 @@ def main():
 
     log(run, "[1/8] PLANNER  — charter 固定")
     charter = planner(seed, args.constraints, cfg, run)
+    bad_engines = unsupported_engines(charter["engines"])
+    if bad_engines:
+        print("未対応 engine が指定されています: " + ", ".join(bad_engines))
+        print("  対応している engine: codex / claude / mock")
+        update_operator_state(run, "failed", reason="unsupported engine")
+        sys.exit(2)
     # 使える engine(実行ファイルが解決できるもの。mock は常に可)を確定。
     # セッションは orchestrator が pywinpty で spawn・駆動する(手動 worker 不要)。
     live = usable_engines(charter["engines"], cfg)
